@@ -1,0 +1,12 @@
+{
+  "name": "riverroot",
+  "owner": { "name": "RiverRoot Studios" },
+  "description": "RiverRoot Studios plugins — Greenhouse dev workflow",
+  "plugins": [
+    {
+      "name": "greenhouse",
+      "source": "./",
+      "description": "Complete dev workflow: Greenhouse + GitHub"
+    }
+  ]
+}

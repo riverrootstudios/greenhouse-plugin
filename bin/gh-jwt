@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# gh-jwt — ensure a fresh Greenhouse session JWT, output shell exports to stdout.
+#
+# Usage:   eval "$(${CLAUDE_PLUGIN_ROOT}/bin/gh-jwt)"
+# Effect:  Sets GREENHOUSE_JWT to a valid (unexpired) session token, plus
+#          GREENHOUSE_URL, GREENHOUSE_PUBLIC_KEY, and three values read off
+#          the token's own claims: GREENHOUSE_ORG_ID, GREENHOUSE_USER_ID and
+#          GREENHOUSE_TEAM_USERNAME.
+#
+# Config resolution (first non-empty wins):
+#   1. Existing environment variable
+#   2. ~/.greenhouse/config          (written by /greenhouse:setup; holds the API key)
+#   3. plugin-shipped config/defaults (GREENHOUSE_URL + GREENHOUSE_PUBLIC_KEY only)
+# This means most people never set a shell env var: the URL and public key ship
+# with the plugin, and the per-user API key lands in ~/.greenhouse/config.
+#
+# Cache:   ~/.greenhouse/jwt (mode 600, written atomically). Re-authenticates
+#          within 60s of expiry, or when a user-bound token is missing the
+#          team_username claim — at most once per 10 minutes for the latter
+#          (marker: ~/.greenhouse/jwt.noclaim holds the last attempt's epoch).
+
+set -e
+
+# ── Resolve config: env wins, then ~/.greenhouse/config, then shipped defaults ──
+bin_dir="$(cd "$(dirname "$0")" && pwd)"
+
+load_config() {
+  [ -f "$1" ] || return 0
+  local line key val
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) continue ;;
+    esac
+    key="${line%%=*}"
+    val="${line#*=}"
+    key="${key//[[:space:]]/}"
+    val="${val%\"}"; val="${val#\"}"
+    case "$key" in
+      GREENHOUSE_URL|GREENHOUSE_PUBLIC_KEY|GREENHOUSE_API_KEY) ;;
+      *) continue ;;
+    esac
+    # Only fill values not already present in the environment (env wins).
+    if [ -z "${!key-}" ]; then
+      export "$key=$val"
+    fi
+  done < "$1"
+}
+
+load_config "${HOME}/.greenhouse/config"
+load_config "${bin_dir}/../config/defaults"
+
+if [ -z "${GREENHOUSE_API_KEY:-}" ]; then
+  printf "echo 'gh-jwt: no Greenhouse API key found. Run /greenhouse:setup to provision one.' >&2; false\n"
+  exit 1
+fi
+
+cache="${HOME}/.greenhouse/jwt"
+noclaim="${cache}.noclaim"
+noclaim_backoff=600
+now=$(date +%s)
+jwt="${GREENHOUSE_JWT:-}"
+
+if [ -z "$jwt" ] && [ -f "$cache" ]; then
+  jwt=$(cat "$cache")
+fi
+
+# Decode a JWT's payload to JSON on stdout (empty on failure).
+# Base64url needs '=' padding restored before base64 -d — macOS/BSD base64
+# rejects unpadded input outright, so skipping this silently yields nothing.
+decode_payload() {
+  local payload="${1#*.}"
+  payload="${payload%%.*}"
+  local pad=$(( (4 - ${#payload} % 4) % 4 ))
+  [ "$pad" -gt 0 ] && payload="${payload}$(printf '=%.0s' $(seq 1 $pad))"
+  printf '%s' "$payload" | tr '_-' '/+' | base64 -d 2>/dev/null || true
+}
+
+exp=0
+cached_user_id=""
+cached_team_username=""
+if [ -n "$jwt" ]; then
+  cached_payload=$(decode_payload "$jwt")
+  exp=$(printf '%s' "$cached_payload" | jq -r '.exp // 0' 2>/dev/null || echo 0)
+  cached_user_id=$(printf '%s' "$cached_payload" | jq -r '.user_id // empty' 2>/dev/null || true)
+  cached_team_username=$(printf '%s' "$cached_payload" | jq -r '.team_username // empty' 2>/dev/null || true)
+fi
+
+# Re-authenticate on expiry — or when the cached token is missing a claim a
+# user-bound token should carry. A token minted before the team_username claim
+# shipped (GH-64) has user_id but no team_username, and the cache holds it for
+# up to a full hour after the migration lands: every identity-bound write would
+# hard-stop for everyone, which is strictly worse than the 403 this replaces.
+# The staleness is client-side, so migration ordering cannot prevent it.
+# Refreshing here makes the transition invisible and generalises to any claim
+# added after a token was minted.
+#
+# A member whose profile genuinely has no team_username would otherwise pay an
+# authenticate_key round trip on EVERY invocation until they claim one (GH-111:
+# that multiplied across every Claude session). So the missing-claim refresh
+# backs off: the epoch of the last refresh that still came back without the
+# claim is kept in $noclaim, and we retry at most once per $noclaim_backoff
+# seconds. Expiry always refreshes regardless.
+missing_claim=false
+if [ -n "$cached_user_id" ] && [ -z "$cached_team_username" ]; then
+  last_noclaim=0
+  if [ -f "$noclaim" ]; then
+    last_noclaim=$(tr -cd '0-9' < "$noclaim" 2>/dev/null || true)
+    last_noclaim=${last_noclaim:-0}
+  fi
+  if [ $((now - last_noclaim)) -ge "$noclaim_backoff" ]; then
+    missing_claim=true
+  fi
+fi
+
+if [ "${exp:-0}" -le $((now + 60)) ] || [ "$missing_claim" = true ]; then
+  jwt=$(curl -fsS --connect-timeout 5 --max-time 15 --retry 2 \
+    -X POST "${GREENHOUSE_URL}/rest/v1/rpc/authenticate_key" \
+    -H "apikey: ${GREENHOUSE_PUBLIC_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "{\"p_api_key\": \"${GREENHOUSE_API_KEY}\"}" 2>/dev/null | jq -r '.token')
+  if [ "$jwt" = "null" ] || [ -z "$jwt" ]; then
+    printf "echo 'gh-jwt: authentication failed. Check your setup with /greenhouse:setup.' >&2; false\n"
+    exit 1
+  fi
+  cache_dir="$(dirname "$cache")"
+  mkdir -p "$cache_dir"
+  # Atomic write: concurrent sessions call gh-jwt in parallel, and a reader
+  # must never see a truncated or empty cache. Temp file in the same dir (so
+  # mv is a rename on one filesystem), mode 600 before any secret lands in it.
+  tmp=$(mktemp "${cache_dir}/jwt.XXXXXX")
+  chmod 600 "$tmp"
+  printf '%s' "$jwt" > "$tmp"
+  mv -f "$tmp" "$cache"
+
+  # Record (or clear) the missing-claim backoff marker off the fresh token.
+  fresh_payload=$(decode_payload "$jwt")
+  fresh_user_id=$(printf '%s' "$fresh_payload" | jq -r '.user_id // empty' 2>/dev/null || true)
+  fresh_team_username=$(printf '%s' "$fresh_payload" | jq -r '.team_username // empty' 2>/dev/null || true)
+  if [ -n "$fresh_user_id" ] && [ -z "$fresh_team_username" ]; then
+    printf '%s\n' "$now" > "$noclaim"
+  else
+    rm -f "$noclaim"
+  fi
+fi
+
+# org_id from the JWT's own claims — the authoritative source. Skills that
+# write to org-scoped tables use "${GREENHOUSE_ORG_ID}" instead of re-deriving
+# it (a hand-rolled base64 decode drops the padding step and silently yields
+# an empty org_id, which RLS then rejects) or reading it from CLAUDE.md (which
+# can disagree with the token you're actually authenticated as).
+org_id=$(decode_payload "$jwt" | jq -r '.org_id // empty' 2>/dev/null || true)
+
+# user_id, off the final token rather than the pre-refresh cached_user_id —
+# that one describes the token we replaced. This is the only signal that
+# separates a legacy org key from a member who has never claimed a username:
+# current_team_username() returns NULL for both (it swallows a missing claim
+# via EXCEPTION WHEN others and returns NULL for an unclaimed profile), and
+# org_role doesn't track user-binding, so a skill that routed on the RPC alone
+# would tell a legacy-key user to go open the web app — which cannot fix it.
+user_id=$(decode_payload "$jwt" | jq -r '.user_id // empty' 2>/dev/null || true)
+
+# team_username, same reasoning applied to identity (GH-64). Skills write it to
+# identity-bound columns — time_entries.owner, claude_usage_*.user_name — where
+# RLS requires the caller's own team_username. Deriving it locally from the
+# GitHub login + the CLAUDE.md Team table is what produced a
+# member's unexplained 403s: a GitHub login is not an attribution key, and a
+# Team table that omits the member cannot supply one. The token can.
+#
+# Empty means the token carries no identity — a legacy org key, or a member who
+# has never claimed a team_username. Both cases must STOP an identity-bound
+# write with a message, never fall back to a locally-guessed name.
+team_username=$(decode_payload "$jwt" | jq -r '.team_username // empty' 2>/dev/null || true)
+
+printf "export GREENHOUSE_URL='%s'\n" "$GREENHOUSE_URL"
+printf "export GREENHOUSE_PUBLIC_KEY='%s'\n" "$GREENHOUSE_PUBLIC_KEY"
+printf "export GREENHOUSE_JWT='%s'\n" "$jwt"
+printf "export GREENHOUSE_ORG_ID='%s'\n" "$org_id"
+printf "export GREENHOUSE_USER_ID='%s'\n" "$user_id"
+printf "export GREENHOUSE_TEAM_USERNAME='%s'\n" "$team_username"

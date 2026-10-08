@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# gh-heartbeat — keep any running Greenhouse session timer alive.
+#
+# Usage:   gh-heartbeat
+# Inputs:  GREENHOUSE_URL, GREENHOUSE_PUBLIC_KEY, GREENHOUSE_JWT
+# Effect:  Calls tick_session_timer() — bumps last_heartbeat_at on every
+#          running entry owned by the calling user. No-op when no timers run.
+#
+# Identity resolves SERVER-SIDE (GH-53): the RPC reads the caller from the JWT
+# (auth.uid() for web sessions, the user_id claim for CLI tokens), so any org
+# member's timers tick — no local GitHub-login → team_username mapping. Org
+# keys carry no user identity; the RPC rejects them and that surfaces below.
+#
+# Failures are reported on stderr but never abort the calling skill (GH-44:
+# a swallowed 42501 hid a broken heartbeat for days). Always exits 0.
+set -u
+
+if [ -z "${GREENHOUSE_URL:-}" ] || [ -z "${GREENHOUSE_JWT:-}" ] || [ -z "${GREENHOUSE_PUBLIC_KEY:-}" ]; then
+  exit 0
+fi
+
+http_code=$(curl -sS --connect-timeout 5 --max-time 15 --retry 2 \
+  -o /dev/null -w '%{http_code}' -X POST \
+  "${GREENHOUSE_URL}/rest/v1/rpc/tick_session_timer" \
+  -H "Content-Type: application/json" \
+  -H "apikey: ${GREENHOUSE_PUBLIC_KEY}" \
+  -H "Authorization: Bearer ${GREENHOUSE_JWT}" \
+  -d '{}' 2>/dev/null) || http_code="000"
+
+case "$http_code" in
+  2*) ;;
+  *) echo "gh-heartbeat: tick_session_timer failed (HTTP ${http_code})" >&2 ;;
+esac
+
+exit 0

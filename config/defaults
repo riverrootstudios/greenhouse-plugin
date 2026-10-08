@@ -1,0 +1,10 @@
+# Greenhouse connection defaults — non-secret, safe to commit.
+# The publishable/anon key is public by design (it ships in every Supabase
+# client bundle); RLS is what protects data. The secret credential is the
+# per-user API key, which lives in ~/.greenhouse/config (written by
+# /greenhouse:setup) or the environment — never here.
+#
+# gh-jwt reads these as the lowest-priority fallback: an env var or a value
+# in ~/.greenhouse/config always wins.
+GREENHOUSE_URL=https://tiyhqgagraqnimqeelfh.supabase.co
+GREENHOUSE_PUBLIC_KEY=sb_publishable_2gjZvf_KYf26J6SoruzAyg_bz1VbxWg

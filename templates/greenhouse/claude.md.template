@@ -1,0 +1,88 @@
+# {PROJECT_NAME}
+
+{PROJECT_DESCRIPTION}
+
+- **Stack:** Next.js 16 (App Router), React 19, Supabase, {ADDITIONAL_STACK}, Tailwind CSS 4, shadcn/ui
+- **Package Manager:** pnpm
+- **Deploy Target:** Vercel
+
+## Team
+
+| Greenhouse | GitHub   |
+| ---------- | -------- |
+| dan        | {DAN_GH} |
+| mb         | {MB_GH}  |
+
+This table lists who can be picked as assignee or reviewer. The **Greenhouse** column is what gets stored — it must be the person's Greenhouse username exactly. The **GitHub** column is used only for `gh pr create --reviewer`.
+
+Who *you* are comes from your token, not from this table: anything written to Greenhouse as the acting user uses `${GREENHOUSE_TEAM_USERNAME}`, which the plugin's `gh-jwt` helper exports. Initials and display names come from the Greenhouse directory.
+
+## Common Commands
+
+```bash
+pnpm dev          # Start dev server
+pnpm lint         # ESLint
+pnpm typecheck    # TypeScript checks
+pnpm build        # Production build
+pnpm test         # Run tests
+```
+
+## Greenhouse Integration
+
+This project uses the Greenhouse plugin for workflow management. Greenhouse (Supabase) is the source of record for all project management.
+
+```greenhouse
+project_id: {PROJECT_ID}
+project_key: {PROJECT_KEY}
+org_id: {ORG_ID}
+```
+
+- **Onboarding:** The Greenhouse plugin auto-installs when you open this repo (via `.claude/settings.json`). Generate a personal CLI token in the web app (Profile → CLI Access), then run `/greenhouse:setup` once — no env vars or PATH edits needed.
+
+## Workflow
+
+All work flows through Greenhouse skills. **Always invoke the matching skill — never perform these operations manually** (no manual `git push`, `gh pr create`, `curl` to Greenhouse API, etc.). The skills handle Greenhouse state, GitHub integration, and traceability in one atomic flow.
+
+| Intent | Skill |
+|--------|-------|
+| Create, plan, or break down work | `/greenhouse:create-ticket` |
+| Prepare a ticket for implementation | `/greenhouse:tend-ticket` |
+| Sow brainstorm feedback into tickets | `/greenhouse:sow-feedback` |
+| Start or implement a ticket | `/greenhouse:work-ticket` |
+| Open a PR | `/greenhouse:open-pr` |
+| Send a no-PR ticket to someone for review (make it their move) | `/greenhouse:send-for-review` |
+| Review a PR (verdict only, no merge) | `/greenhouse:review-pr` |
+| Merge an approved PR (author lands it) | `/greenhouse:merge-pr` |
+| Address review feedback | `/greenhouse:fix-review-feedback` |
+| Check status / what's in flight | `/greenhouse:dashboard` |
+| Sync token usage | `/greenhouse:sync-usage` |
+| Onboard onto Greenhouse (store CLI token) | `/greenhouse:setup` |
+| Clean up after merge, check sync | `/greenhouse:health-check` |
+| Tag a release | `/greenhouse:release` |
+
+**Rules:**
+- No code without a ticket — if implementation is requested and no ticket exists, create one first via `/greenhouse:create-ticket`
+- After implementation, always run `/greenhouse:open-pr` — never manually push, create PRs, or update Greenhouse
+- After merge, run `/greenhouse:health-check` to clean up
+- After review feedback, run `/greenhouse:fix-review-feedback` — never manually implement review comments
+
+## Work Breakdown Philosophy
+
+One ticket = one branch = one PR = one squash commit on the integration branch. A ticket is the largest coherent unit of work that produces a single reviewable PR — it can span multiple sessions. Prefer fewer, bigger tickets. Vertical slices over horizontal layers.
+
+## Commit Convention
+
+```
+{type}: {description} [{TICKET-ID}]
+```
+
+Types: `feat`, `fix`, `chore`, `refactor`, `test`, `docs`, `style`, `perf`, `ci`, `hotfix`
+
+## Git Workflow
+
+- All code reaches `main` through reviewed PRs only
+- Ticket PRs squash-merge into the integration branch (`dev` if the repo has one, else `main`; override with `integration_branch` in the `greenhouse` fence)
+- With a `dev` branch, `main` takes merge commits from it at release — set `release_flow: promotion-pr` in the fence
+- Branch naming: `{initials}/{ticket-id}-{short-description}`
+- `Implements {TICKET-ID}` required in every PR body
+- Review target: within 4 hours during working hours
