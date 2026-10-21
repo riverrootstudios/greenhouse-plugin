@@ -32,9 +32,9 @@ Supabase PostgreSQL backend for the Greenhouse plugin. All access via PostgREST 
 `attachment_added` / `attachment_removed` (GH-66) carry `{file_name, size_bytes}` in `value_was`. They are audit-only: `get_deliverable_notifications()` never dispatches them and a Slack rule's `events` CHECK cannot name them.
 
 ### pr_stage
-`drafting` · `awaiting_review` · `awaiting_changes` · `awaiting_re_review` · `checks_failing` · `ready_to_merge`
+`drafting` · `awaiting_review` · `awaiting_changes` · `awaiting_re_review` · `checks_failing` · `checks_running` · `ready_to_merge`
 
-Mirrors the `PrStage` TS union exactly (GH-88); the pgTAP suite pins both value sets. Derived by `derivePrStage` in `web/lib/pr-stage.ts`, never hand-set. `checks_failing` replaces `ready_to_merge` when an approved PR is still not mergeable (a red required check, a conflict, or a branch that needs updating).
+Mirrors the `PrStage` TS union exactly (GH-88); the pgTAP suite pins both value sets. Derived by `derivePrStage` in `web/lib/pr-stage.ts`, never hand-set. It's the reviewer's move only when GitHub has them requested again; a push alone leaves the last verdict standing (GH-116). Once an approval decides it: `checks_failing` when the PR still can't merge (a red required check, a conflict, or a branch that needs updating), `checks_running` while required checks haven't finished, otherwise `ready_to_merge`. An approval GitHub doesn't count (its `reviewDecision` says review required, or another reviewer's changes request still stands) reads `awaiting_review` or `awaiting_changes`, the author's move.
 
 ### pr_checks_state
 `none` · `pending` · `passing` · `failing`
@@ -224,7 +224,7 @@ One row per **open** GitHub pull request (GH-88), the collection every ticket su
 | Column | Type | Required | Default | Notes |
 |--------|------|----------|---------|-------|
 | id | UUID | PK | auto | |
-| repo, number | TEXT, INTEGER | yes, unique together | — | `repo` is the lowercased repository name |
+| owner, repo, number | TEXT, TEXT, INTEGER | yes, unique together | `owner` generated | `owner` is the lowercased GitHub owner, generated from `url` (GH-115); `repo` is the lowercased repository name |
 | url, title, author_login | TEXT | yes | — | |
 | draft | BOOLEAN | yes | false | Derivation input |
 | head_sha | TEXT | yes | — | Derivation input |
@@ -245,13 +245,29 @@ One row per **open** GitHub pull request (GH-88), the collection every ticket su
 
 **RLS:** SELECT only, the tickets shape — `org_id = get_user_org_id() AND (is_org_admin_or_owner() OR (project_id IS NOT NULL AND user_has_project_access(project_id)))`. Members see PRs for projects they have been granted; owners/admins see the whole org, including NULL-project rows.
 
-**Sync (web app):** `/api/cron/sync-pull-requests` runs every 5 minutes (`web/vercel.json`) as the reconciler — a plain full pass over the 100 most recently updated open and merged PRs; writes nothing if a GitHub search fails, deletes a row only when a successful pass did not see the PR open (and nothing at all when the open search fills its page), and runs the `in_review → harvest` transition only for a merge newer than the previous successful run, so a ticket reopened after its PR merged is not re-harvested. `/api/webhooks/github` is the fast path — an org-level hook subscribed to Pull requests, Pull request reviews, Check suites and Statuses, verified by HMAC over the raw body (`GITHUB_WEBHOOK_SECRET`), answering 200 once verified because GitHub does not retry. A change to `stage`, `up_next_login` or `checks_state` broadcasts a contentless `pr-state` event on each open `board:{id}` channel; boards refetch through their own RLS-scoped poll. `/api/github-prs` (the Home widget) reads this table and makes no GitHub calls.
+**Sync (web app):** `/api/cron/sync-pull-requests` runs every 5 minutes (`web/vercel.json`) as the reconciler — one pass per (Greenhouse org, GitHub owner) connection that a project's `repository_url` makes, each with that org's own token (see [github_connections](#github_connections)), over the owner's 100 most recently updated open and merged PRs. A connection writes, back-syncs and deletes only its own org's rows and tickets; a repo that projects in two orgs point at is skipped. A connection with no token is skipped and a failed search writes nothing for it; a row is deleted only when its connection's successful pass did not see the PR open (and nothing for a connection whose open search fills its page); the `in_review → harvest` transition runs only for a merge newer than that connection's previous pass, so a ticket reopened after its PR merged is not re-harvested. `/api/webhooks/github` is the fast path — an org-level hook in each GitHub org, subscribed to Pull requests, Pull request reviews, Check suites and Statuses, verified by HMAC over the raw body (one shared `GITHUB_WEBHOOK_SECRET`), answering 200 once verified because GitHub does not retry. A change to `stage`, `up_next_login` or `checks_state` broadcasts a contentless `pr-state` event on each open `board:{id}` channel; boards refetch through their own RLS-scoped poll. `/api/github-prs` (the Home widget) reads this table and makes no GitHub calls.
 
 **Plugin:** read-only for skills. `GET /rest/v1/pull_requests?ticket_id=eq.{uuid}` shows a ticket's open PR state; skills never write here.
 
 ### pull_request_sync_state
 
-A single row (`id = 1`) of sync health: `last_success_at`, `last_error`, `last_error_at`, `last_webhook_at`. Readable by org admins/owners only; the Home widget renders it as a muted line. `last_webhook_at` going cold while `last_success_at` keeps advancing means deliveries are silently failing — the one failure mode the reconciler masks.
+A single row (`id = 1`) of sync health: `last_success_at`, `last_error`, `last_error_at`, `last_webhook_at`. Readable by org admins/owners only; the Home widget renders it as a muted line. `last_webhook_at` going cold while `last_success_at` keeps advancing means deliveries are silently failing — the one failure mode the reconciler masks. Run-level only since GH-115: a problem with one connection (no token, an expired token, a 404) is recorded on its `github_connections` row instead, so it never shows on the Home widget.
+
+### github_connections
+
+One row per (Greenhouse org, GitHub owner) connection — the PR sync's access to that owner for that org, and its health (GH-115). A connection's token syncs only its own org's projects: two orgs pointing at one GitHub owner each bring their own. The reconciler creates a row for every pair a project makes; admins set the token in **Organization Settings → GitHub**, which checks it against every repo the org's projects point at in that owner before storing it (one token serves all of them), and whose **Test** re-runs that check. The token itself is never a column: it lives in Vault as `github_token_{id}`. `GITHUB_TOKEN` stands in for `GITHUB_ORG` only while exactly one org points there.
+
+| Column | Type | Notes |
+|--------|------|-------|
+| org_id, github_owner | UUID, TEXT | Unique together. `github_owner` is lowercase |
+| token_set_at | TIMESTAMPTZ | Stamped by `set_github_token`, cleared by `clear_github_token` |
+| token_expires_at | TIMESTAMPTZ | From GitHub's `github-authentication-token-expiration` header; NULL = no expiry |
+| last_ok_at, last_error, last_error_at | | The connection's last working call (reconciler, webhook, reviewer sync, Test) / last read failure (reconciler, webhook, Test) |
+| last_webhook_at | TIMESTAMPTZ | Last delivery from that owner's hook, stamped at most once a minute |
+| last_reconciled_at | TIMESTAMPTZ | Bounds the connection's merged search on the next pass |
+| last_write_error, last_write_error_at | TEXT, TIMESTAMPTZ | The last reviewer write (GH-104) GitHub refused with 401/403/404, kept until a write succeeds or the token changes — a read-only token keeps passing the reconciler's reads |
+
+**RLS:** SELECT for the org's admins/owners only; no write policies. **RPCs:** `set_github_token(p_owner, p_token, p_expires_at)` and `clear_github_token(p_owner)` (admin/owner of the caller's org, and only for an owner one of its projects points at); `get_github_token(p_org_id, p_owner)` is service-role only. Skills never touch this table.
 
 ---
 
