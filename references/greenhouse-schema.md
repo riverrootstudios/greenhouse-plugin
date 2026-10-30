@@ -428,13 +428,13 @@ Raw design-partner feedback captured in the web Brainstorm view (or via `POST /a
 | created_at | TIMESTAMPTZ | yes | now() | |
 | updated_at | TIMESTAMPTZ | yes | now() | Trigger |
 
-**Skills read this table** (sow-feedback) but never write it — capture happens in the web app.
+**Skills read this table** (sow-feedback). Capture happens in the web app, and sow-feedback writes only `summary` and `customer_id`.
 
 ---
 
 ### customers
 
-Customers and design partners a project's brainstorm notes are about (GH-76). A name list, not a CRM — the structured record lives in Close, and this is deliberately not the `companies` table (RRS's own sales pipeline). Managed on the web Customers page or inline from the brainstorm composer. Same per-operation RLS as `brainstorm_notes`: members read and write only customers on granted projects; owners/admins see the org.
+Customers and design partners a project's brainstorm notes are about (GH-76). A name list, not a CRM — the structured record lives in Close, and this is deliberately not the `companies` table (RRS's own sales pipeline). Managed on the web Customers page, inline from the brainstorm composer, or by sow-feedback when a note names a new customer. Same per-operation RLS as `brainstorm_notes`: members read and write only customers on granted projects; owners/admins see the org.
 
 | Column | Type | Required | Default | Notes |
 |--------|------|----------|---------|-------|
@@ -460,7 +460,7 @@ One row per sowing of a brainstorm note (`/greenhouse:sow-feedback`). A note wit
 | triaged_by | TEXT | yes | — | Who sowed |
 | triaged_at | TIMESTAMPTZ | yes | now() | |
 | tickets_touched | UUID[] | yes | `{}` | Tickets created/updated by this sowing |
-| dropped | JSONB | yes | `[]` | `[{"requirement", "reason"}]` per non-actioned item |
+| dropped | JSONB | yes | `[]` | `[{"requirement", "reason"}]` per non-actioned item. `reason` starts with one of nine words: **Covered** · **Answer** · **Decided** · **Process** · **Not now** · **One asker** · **Not product** · **Concern** · **Open question** (defined in [sow-feedback §Drop reasons](../skills/sow-feedback/SKILL.md#drop-reasons)). **Decided** drops are standing rules that every later sowing reads. Rows from before GH-121 have no prefix |
 | action_summary | TEXT | no | — | e.g. `"2 created, 1 updated, 1 dropped"` |
 
 ---

@@ -41,12 +41,13 @@ Work with no PR — design, copy, research, decisions, approvals — goes `sprou
 | Transition | Triggered By |
 |------------|-------------|
 | seeds → sprouted | `/tend-ticket` (sets tended flag) or manual triage |
+| sprouted → seeds | `/tend-ticket` premise check: **park** (an open question comes first; `tended` is not set) |
 | sprouted → in_bloom | `/work-ticket` |
 | in_bloom → in_review | `/open-pr` |
 | in_review → harvest | `/review-pr` |
 | in_review → changes_requested | `/review-pr` (when requesting changes) |
 | changes_requested → in_bloom | `/fix-review-feedback` |
-| Any → weeded | Manual or `/create-ticket` |
+| Any → weeded | Manual, `/create-ticket`, or the `/tend-ticket` premise check: **weed** |
 | Blocker detected | Add blocking relation to `ticket_relations` (see below) |
 
 ### Blocks / Blocked By (Relations Table)

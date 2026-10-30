@@ -15,7 +15,7 @@ The most important skill for autonomous workflow — a well-tended ticket means 
 
 **Proportional to complexity.** Don't interrogate a 1–2pt ticket — a quick confirm is enough. Scale the questioning up with the score: 8pt+ tickets deserve genuine back-and-forth on scope, architecture, and infrastructure; 16pt+ almost always hide unstated requirements worth surfacing before any code is written.
 
-**One-shot escape hatch.** If the user says "just tend it" / "don't ask" / "autonomous," skip the interactive prompts, make reasonable choices, record assumptions in `open_decisions`, and present the result in one pass.
+**One-shot escape hatch.** If the user says "just tend it" / "don't ask" / "autonomous," skip the interactive prompts, make reasonable choices, record assumptions in `open_decisions`, and present the result in one pass. The [Premise Check](#step-23-premise-check) still runs: take its recommended outcome and record it in `open_decisions`.
 
 Route surfaced decisions into the ticket: firm choices become acceptance criteria; unresolved ones go to `open_decisions` so `work-ticket` inherits them.
 
@@ -65,6 +65,12 @@ ${CLAUDE_PLUGIN_ROOT}/bin/gh-heartbeat
 
 **If not found:** *"No untended tickets in sprouted or seeds — want me to plan some new work?"*
 
+**Waiting on a decision:** check this before anything else. When the context's relations hold a `blocked_by` entry whose `related_status` isn't `harvest` or `weeded`, look up those tickets' types (`GET /rest/v1/tickets?id=in.({related_ticket_ids})&select=display_id,title,type`). If one is `no_code`, say so first and recommend waiting for that decision:
+
+> "{ID} is blocked by {decision ID}: {title}, a decision that hasn't been made. Tending now builds on a guess, so I'd wait for it. Tend anyway?"
+
+Continue only on the user's say-so. A one-shot tend notes the wait in `open_decisions` and continues, since work-ticket's blocker check holds the work back anyway.
+
 ---
 
 ## Step 2: Read Codebase Context
@@ -75,6 +81,51 @@ Based on the ticket's description and labels:
 2. Read key files: architecture, patterns, related components
 3. Check for existing similar implementations to follow as patterns
 4. Note any recent changes that might affect this ticket
+
+---
+
+## Step 2.3: Premise Check
+
+Asks whether a big ticket that came from feedback should be built as scoped, before its criteria are expanded. Run it only when both of these hold, and otherwise skip it without saying anything:
+
+- **Sown:** a sowing touched this ticket. `%7B…%7D` is the array's braces, URL-encoded:
+  ```
+  GET /rest/v1/brainstorm_triage?tickets_touched=cs.%7B{ticket_uuid}%7D&select=triaged_at,brainstorm_notes(id,title,customer_id,customers(name))
+  ```
+  An empty array means the ticket isn't sown. The description's `**Source:**` line is no signal, because sow writes it only when the note has `source_attribution`.
+- **Big:** `complexity` is 16 or more, or Step 2's reading puts it there (a first tend still carries sow's rough score), or it sits on rung 5: a `**Rung:** 5` line, or a core-model column or table, nav item, org setting or service line in its scope.
+
+Build the case from the ticket and these sources:
+
+- **Need:** what the asker is trying to get done. Take it from the sowing notes, reading only the exchange the ticket came from: save each note's body to a temp file (`GET /rest/v1/brainstorm_notes?id=eq.{note_id}&select=body`) and `grep -n -i -E -C10 '{keywords}'` it, never reading the whole transcript.
+- **Who asked:** those notes (title, customer, date), plus the earlier drops that match. Run [sow-feedback §Earlier drops](../sow-feedback/SKILL.md#earlier-drops) with keywords from this ticket.
+- **Rung:** the `**Rung:**` line, or place it on the [Simplicity Ladder](../../references/work-breakdown.md#simplicity-ladder) now. A ticket's rung is its highest part, so name that part.
+- **Cheaper:** the lowest rung that might meet the need, and why it doesn't.
+- **Not building costs:** what the asker keeps doing if this never ships.
+
+End in one decision, asked as one question rather than a series:
+
+```
+Premise: {ID} — {title} ({N}pt, rung {n})
+Need:       {…}
+Who asked:  {date} {note title}, {customer}; earlier: {date} {note title} — {reason}; …
+Rung:       {n} · {the part that sets it}
+Cheaper:    {alternative} — not enough because {why}
+Not building costs: {…}
+
+Decision: build {ID} as scoped
+Options: proceed / shrink / park / weed
+Recommend: {one} — {one-line why}
+```
+
+| Outcome | What happens |
+|---------|--------------|
+| **proceed** | Continue to Step 2.5 |
+| **shrink** | Rewrite the scope in this tend, so the criteria and description follow the smaller version, and continue. A cut part that still needs doing, such as a bundled regression, goes on the [out-of-scope list](../../references/common-operations.md#out-of-scope-findings) and is filed only on a yes |
+| **park** | PATCH `status` → `seeds` without setting `tended`, and comment the Open question that has to be answered first. Stop the tend |
+| **weed** | PATCH `status` → `weeded`, and comment the reason. Stop the tend |
+
+Park and weed PATCHes carry `updated_by`, and their comments carry `author` and `org_id`, all as in Step 7.
 
 ---
 
@@ -95,10 +146,19 @@ Ask: {1–2 followup questions}
 
 ## Step 2.7: Elicit Requirements (Socratic)
 
-Before expanding criteria, draw out what the ticket *doesn't* say yet. Ask targeted questions — batch a focused handful, don't drip one at a time — aimed at the gaps most likely to bite. Skip questions the ticket or codebase already answers; only ask what genuinely changes the work. Run through these lenses, as relevant:
+Before expanding criteria, draw out what the ticket *doesn't* say yet. Ask targeted questions — batch a focused handful, don't drip one at a time — aimed at the gaps most likely to bite. Skip questions the ticket or codebase already answers; only ask what genuinely changes the work.
+
+**Start with any `open_decisions` already on the ticket,** such as a detail sow deferred, and put them before the lenses. Then run through these lenses, as relevant:
 
 - **Themes & fit** — what's the underlying theme, and how does this fit the product and existing patterns? Is it consistent with how the rest of the app already works, or introducing a new way of doing something?
-- **Simplicity** — what's the smallest version that's still useful? What can be cut, deferred, or reused instead of built? Push back on accidental complexity.
+- **Simplicity** — state a position the user can refute, not an open question: *"a flag does this at 4pt; the column buys X — keep it only if X matters."* Draw on one or two of these questions, never all of them:
+  - What do they do if we never build it?
+  - Would the smallest and the largest customer use it the same way?
+  - Is it a new thing to learn, or an existing thing getting better?
+  - What do we hide to make room?
+  - What does the customer stop doing once it ships?
+
+  The [Simplicity Ladder](../../references/work-breakdown.md#simplicity-ladder) names the cheaper rungs. Push back on accidental complexity.
 - **UX completeness** — every state and path: empty, loading, error, partial, concurrent, offline, first-run, at-limit; plus success/confirmation, undo, and mobile/responsive and accessibility.
 - **Data model updates** — new/changed tables or columns, relationships, constraints, indexes, migrations and backfill, and RLS implications of the shape.
 - **Auth patterns** — who can do this? Role/permission checks, org/tenant scoping, RLS policies, and whether it follows the existing auth model or bends it.

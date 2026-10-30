@@ -36,6 +36,25 @@ Each ticket = one PR = one CI run, so prefer fewer, bigger tickets over many sma
 
 ---
 
+## Simplicity Ladder
+
+Before sizing an ask, place it on the ladder. The lowest rung that meets the need wins. [sow-feedback](../skills/sow-feedback/SKILL.md) and [tend-ticket](../skills/tend-ticket/SKILL.md) both use this definition.
+
+| Rung | Meets the need by |
+|------|-------------------|
+| **0** | It exists already: answer the question or demo it |
+| **1** | Ops does it by hand |
+| **2** | Configuring what exists |
+| **3** | Extending an existing feature |
+| **4** | A new feature in an existing pattern |
+| **5** | A new concept: a core-model column or table, a nav item, an org setting, a service line |
+
+- **A ticket's rung is its highest part.** Name the part that sets it. An org default nobody asked for can lift a rung-3 ticket to rung 5 without anyone noticing.
+- **A rung-5 create states its reason in the ticket.** Two or more orgs asking is evidence for it, not a gate. One customer with a reason that holds for many can earn rung 5. Repeated asks for an old tool's behaviour can still be a rung-2 answer.
+- **A bug or regression has no rung.** It is its own ticket, never an item inside a feature ticket.
+
+---
+
 ## Complexity Scale (Powers of 2)
 
 Complexity points drive how the agent approaches the work — not just how big it is, but how to execute it.
