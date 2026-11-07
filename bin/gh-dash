@@ -1,0 +1,1499 @@
+#!/usr/bin/env node
+// gh-dash: the local dashboard for gh-coord (GH-129). Each chat is a card in its stage
+// (work -> review <-> fix -> merge -> the integration branch); arrows light when the coordinator log
+// shows a ticket moving between stages. Also the DB lock, heavy slots, the local stack, a lock
+// timeline, the machine's gauges and the log. The start buttons open named Claude Code chats.
+//
+// It is also the one process on this machine that talks to Greenhouse: it reports its chats and a
+// machine summary to report_agent_state, and takes start requests queued for this machine from a
+// ticket page. Run it from inside the repo (or any worktree of it).
+//
+//   gh-dash                    serves http://127.0.0.1:${GREENHOUSE_DASH_PORT:-7777} (the next free port when taken)
+//   gh-dash --open             same, and opens it in the browser
+//   gh-dash --detach [--open]  starts it in the background, so it outlives the chat or terminal that started it
+//   gh-dash --report-preview   prints exactly what it would send Greenhouse, and exits
+//
+// Reads gh-coord's config (the repo's greenhouse block plus GREENHOUSE_* env vars). Also honors
+// GREENHOUSE_DASH_PORT, GREENHOUSE_TERMINAL (terminal | iterm) and GREENHOUSE_PLUGIN_DIR (a plugin
+// checkout that terminal and background starts load with --plugin-dir, for trying the plugin
+// before a release).
+'use strict';
+const http = require('node:http');
+const fs = require('node:fs');
+const path = require('node:path');
+const os = require('node:os');
+const { execFile, execFileSync, spawn } = require('node:child_process');
+const { randomUUID } = require('node:crypto');
+
+// gh-dash isn't a chat, and it's usually started from one (`! gh-dash --detach`, or a loop skill).
+// Drop that chat's Claude Code session variables (CLAUDECODE, CLAUDE_CODE_SESSION_ID,
+// CLAUDE_CODE_CHILD_SESSION, its messaging socket and token, ...): otherwise every chat started here
+// inherits them and runs as that chat's child, with no transcript or session file of its own, and a
+// Terminal launched from here would pass them to every window. CLAUDE_CONFIG_DIR stays.
+for (const name of Object.keys(process.env)) {
+  if (name === 'CLAUDECODE' || name.startsWith('CLAUDE_CODE_')) delete process.env[name];
+}
+
+const BIN = __dirname;
+const ARGS = process.argv.slice(2);
+
+function loadConfig() {
+  const out = execFileSync(path.join(BIN, 'gh-coord'), ['config'], { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'pipe'] });
+  const cfg = {};
+  for (const line of out.split('\n')) {
+    const i = line.indexOf('=');
+    if (i > 0) cfg[line.slice(0, i)] = line.slice(i + 1);
+  }
+  return cfg;
+}
+let CFG;
+try { CFG = loadConfig(); } catch (e) {
+  console.error(`gh-dash: ${String(e.stderr || e.message).trim()}`);
+  process.exit(1);
+}
+
+const KEY = CFG.KEY;
+const key = KEY.toLowerCase();
+const MAIN = CFG.MAIN;
+const STATE = CFG.STATE;
+const BASE = CFG.BASE;
+const PROJECT_ID = CFG.PROJECT_ID;
+const MACHINE = CFG.MACHINE;
+const LOCAL_STACK = CFG.LOCAL_STACK || '';
+const STALE_MIN = Number(CFG.STALE_MIN || 30);
+const HEAVY_SLOTS = Number(CFG.HEAVY_SLOTS || 1);
+const BASE_PORT = Number(process.env.GREENHOUSE_DASH_PORT || 7777);
+const TERMINAL = process.env.GREENHOUSE_TERMINAL === 'iterm' ? 'iterm' : 'terminal';
+const PLUGIN_DIR = process.env.GREENHOUSE_PLUGIN_DIR || '';
+const TIMELINE_H = 6;
+const IDLE_CHAT_MIN = 30; // chats with no claim and no open session drop off after this long unseen
+const QUIET_MIN = 60; // a claim whose chat isn't open and hasn't called gh-coord for this long may have lost its chat
+const STACK_GRACE_MS = 30e3; // a db reset restarts the db container: the stack counts as down only after this long gone
+const STARTUP_GRACE_MS = 2 * 60e3; // a chat started here that hasn't written a turn by then is stuck
+const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+const SESSIONS = path.join(CLAUDE_DIR, 'sessions');
+const PROJECTS = path.join(CLAUDE_DIR, 'projects');
+const LOOPS = ['review', 'fix', 'merge'];
+const KINDS = ['review', 'fix', 'merge', 'work', 'tend'];
+const ROLES = ['work', 'review', 'fix', 'merge', 'tend'];
+const MODES = process.platform === 'darwin' ? ['terminal', 'background', 'vscode'] : ['background', 'vscode'];
+const PID_FILE = path.join(STATE, 'dash.pid');
+const PORT_FILE = path.join(STATE, 'dash.port');
+const LOG_FILE = path.join(STATE, 'dash.log');
+const MODE_FILE = path.join(STATE, 'start-mode');
+const NAMES_FILE = path.join(STATE, 'names');
+// Shared with gh-coord's hooks: a chat started here leaves a starting marker until its first prompt
+// or tool call (gh-coord seen) shows it got past its startup dialogs.
+const MARKERS = process.env.GREENHOUSE_MARKERS_DIR || `/tmp/greenhouse-agents-${process.getuid()}`;
+
+const ls = (dir) => { try { return fs.readdirSync(dir).filter((n) => !n.startsWith('.')); } catch { return []; } };
+const localTime = (s) => (s ? new Date(s.replace(' ', 'T')).getTime() : null);
+const within = (p, root) => !!p && !!root && (p === root || p.startsWith(root + '/'));
+const inRepo = (p) => !!p && (within(p, MAIN) || p.startsWith(MAIN + '-'));
+const alive = (pid) => { try { process.kill(Number(pid), 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+const mtimeMs = (f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
+const base = (p) => (p ? p.split('/').filter(Boolean).pop() : null);
+const iso = (ms) => (ms ? new Date(ms).toISOString() : null);
+// What leaves the machine: `doing` without NAME=value pairs (env values), at most 120 characters.
+const sanitize = (s) => (s ? String(s).replace(/\n/g, ' ').replace(/(^|\s)[A-Za-z_][A-Za-z0-9_]*=\S*/g, '$1').replace(/\s+/g, ' ').trim().slice(0, 120) || null : null);
+
+// gh-coord's key=value files, plus the file's mtime (its heartbeat, or a chat's last-seen).
+function kvFile(file) {
+  try {
+    const out = {};
+    for (const line of fs.readFileSync(file, 'utf8').split('\n')) {
+      const i = line.indexOf('=');
+      if (i > 0) out[line.slice(0, i)] = line.slice(i + 1);
+    }
+    out.mtime = fs.statSync(file).mtimeMs;
+    return out;
+  } catch { return null; }
+}
+
+function readTail(file, bytes) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const { size } = fs.fstatSync(fd);
+      const start = Math.max(0, size - bytes);
+      const buf = Buffer.alloc(size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      const text = buf.toString('utf8');
+      return start > 0 ? text.slice(text.indexOf('\n') + 1) : text;
+    } finally { fs.closeSync(fd); }
+  } catch { return ''; }
+}
+
+function readHead(file, bytes) {
+  try {
+    const fd = fs.openSync(file, 'r');
+    try { const buf = Buffer.alloc(bytes); return buf.toString('utf8', 0, fs.readSync(fd, buf, 0, bytes, 0)); }
+    finally { fs.closeSync(fd); }
+  } catch { return ''; }
+}
+
+// A chat's transcript: Claude Code files it under the folder it started in, and can move it when the
+// chat enters a worktree, so fall back to looking in every project folder.
+function transcriptOf(id, hint) {
+  if (hint && fs.existsSync(hint)) return hint;
+  for (const dir of ls(PROJECTS)) {
+    const f = path.join(PROJECTS, dir, `${id}.jsonl`);
+    if (fs.existsSync(f)) return f;
+  }
+  return null;
+}
+
+function customTitle(id, cwd) {
+  const head = readHead(path.join(PROJECTS, String(cwd).replace(/[^a-zA-Z0-9]/g, '-'), `${id}.jsonl`), 65536);
+  const all = [...head.matchAll(/"customTitle":"([^"]*)"/g)];
+  return all.length ? all[all.length - 1][1] : null;
+}
+
+// Claude Code keeps a file per running chat in ~/.claude/sessions. A name given with -n or /rename
+// shows there; a derived one ("greenhouse-92") is replaced by the transcript's custom title if any.
+function openChats() {
+  return ls(SESSIONS).filter((n) => n.endsWith('.json')).map((n) => {
+    try {
+      const s = JSON.parse(fs.readFileSync(path.join(SESSIONS, n), 'utf8'));
+      if (!alive(s.pid) || !inRepo(s.cwd)) return null;
+      if (!s.name || s.nameSource === 'derived') s.name = customTitle(s.sessionId, s.cwd) || s.name;
+      return s;
+    } catch { return null; }
+  }).filter(Boolean);
+}
+
+// Busy or idle, as Claude Code itself reports it. `claude agents --json` takes about half a second,
+// so it refreshes in the background.
+const agents = { status: new Map(), at: 0 };
+function refreshAgents() {
+  if (Date.now() - agents.at < 10e3) return;
+  agents.at = Date.now();
+  execFile('claude', ['agents', '--json'], { timeout: 8000, maxBuffer: 4 << 20 }, (err, out) => {
+    if (err) return;
+    try {
+      const m = new Map();
+      for (const a of JSON.parse(out)) if (a.sessionId) m.set(a.sessionId, a.status === 'busy' || a.status === 'idle' ? a.status : null);
+      agents.status = m;
+    } catch {}
+  });
+}
+
+function locks(now) {
+  let db = null;
+  if (fs.existsSync(path.join(STATE, 'db.lock'))) {
+    const o = kvFile(path.join(STATE, 'db.lock', 'owner')) || {};
+    db = {
+      label: o.label, path: o.path, purpose: o.purpose, since: localTime(o.since), heartbeat: o.mtime,
+      // gh-coord also checks for a process still running in the worktree before breaking it.
+      stale: o.path && !fs.existsSync(o.path) ? 'worktree gone'
+        : o.mtime && now - o.mtime >= STALE_MIN * 60e3 ? `no heartbeat for ${STALE_MIN}m+` : null,
+    };
+  }
+  const waiting = ls(path.join(STATE, 'db.waiting')).map((name) => {
+    let raw = '';
+    try { raw = fs.readFileSync(path.join(STATE, 'db.waiting', name), 'utf8').trim(); } catch {}
+    const m = raw.match(/^(.*) \(queued (.+?), (.+)\)$/);
+    return { label: name.replace(/_/g, '/'), purpose: m ? m[1] : raw, since: m ? localTime(m[2]) : null };
+  }).sort((a, b) => (a.since || 0) - (b.since || 0));
+  const heavy = [];
+  for (let i = 1; i <= HEAVY_SLOTS; i++) {
+    const dir = path.join(STATE, 'heavy', `slot${i}`);
+    if (!fs.existsSync(dir)) { heavy.push({ slot: i }); continue; }
+    const o = kvFile(path.join(dir, 'owner')) || {};
+    heavy.push({
+      slot: i, held: true, label: o.label, cmd: o.cmd, path: o.path, since: localTime(o.since),
+      heartbeat: o.mtime, stale: o.pid && !alive(o.pid) ? 'runner gone' : null,
+    });
+  }
+  return { db, waiting, heavy };
+}
+
+// The plugin's Notification hook records what a chat is waiting on (gh-coord needs-you). It's
+// answered once the chat writes its transcript again. Loop chats sit idle between ticks, so idle
+// only counts for chats that aren't loops.
+const NEEDS = { permission_prompt: 'permission', idle_prompt: 'idle', agent_needs_input: 'question', elicitation_dialog: 'question' };
+const LOOP_NAME = new RegExp(`^${key}-(review|fix|merge|work) \\d+$`);
+const firstTurnSeen = new Set();
+// A chat has got going once it calls gh-coord (which writes path=), Claude Code reports a status
+// for it, or its transcript has a turn. Some folders (under /tmp) get no transcript or session
+// file at all, so the transcript alone can't decide.
+function needsOf(o, id, name, now, session) {
+  if (o.needs) {
+    const kind = NEEDS[o.needs] || 'question';
+    const answered = o.transcript && mtimeMs(o.transcript) > Number(o.needs_at) * 1000 + 1000;
+    if (!answered && !(kind === 'idle' && LOOP_NAME.test(name || ''))) return kind;
+  }
+  const going = !!o.path || ['busy', 'idle', 'waiting'].includes(session?.status) || firstTurnSeen.has(id);
+  if (o.started_by === 'gh-dash' && o.started && !going && now - Number(o.started) * 1000 > STARTUP_GRACE_MS) {
+    const f = transcriptOf(id, o.transcript);
+    if (f && readHead(f, 1 << 20).includes('"type":"assistant"')) firstTurnSeen.add(id);
+    else return 'startup';
+  }
+  return null;
+}
+
+// One row per claim (with its chat when gh-coord knows it), then chats holding no claim.
+function rows(now, { db, waiting, heavy }) {
+  const open = new Map(openChats().map((s) => [s.sessionId, s]));
+  const chats = ls(path.join(STATE, 'chats')).map((id) => {
+    const o = kvFile(path.join(STATE, 'chats', id));
+    if (!o) return null;
+    const session = open.get(id);
+    let name = o.name || session?.name || null;
+    // A chat started in VS Code keeps Claude's own title; show it by its claim instead.
+    if (o.label && !(name || '').startsWith(`${key}-`)) {
+      const [tk, role] = o.label.split('/');
+      name = `${tk.toLowerCase()}${role === 'work' ? '' : ` ${role}`}`;
+    }
+    return {
+      id, ticket: o.ticket || null, role: o.role || null, label: o.label || null, lastTicket: o.last_ticket || null,
+      doing: o.doing || null, path: o.path || session?.cwd || null, seen: o.mtime, name, since: localTime(o.since),
+      open: !!session, status: agents.status.get(id) ?? (session && (session.status === 'busy' || session.status === 'idle') ? session.status : null),
+      needs: needsOf(o, id, name, now, session), mode: o.mode || null,
+    };
+  }).filter(Boolean);
+  const used = new Set();
+  const out = ls(path.join(STATE, 'claims')).map((ticket) => {
+    const c = kvFile(path.join(STATE, 'claims', ticket, 'owner')) || {};
+    const worktree = c.path && c.path !== '-' ? c.path : null;
+    // A resumed chat re-claims as "already mine", so several chats can carry the ticket in the same
+    // role: show the most recently seen one. A chat in another role on the same ticket (a tend chat
+    // beside the work chat) keeps its own row.
+    const role = (c.label || '').split('/')[1];
+    const mine = chats.filter((h) => (c.chat && h.id === c.chat) || (h.ticket === ticket && h.role === role)).sort((a, b) => b.seen - a.seen);
+    mine.forEach((h) => used.add(h.id));
+    const chat = mine[0] || chats.find((h) => !h.ticket && !used.has(h.id) && within(h.path, worktree));
+    if (chat) used.add(chat.id);
+    return {
+      ticket, label: c.label, role: (c.label || '').split('/')[1] || c.label, claimed: localTime(c.since),
+      worktree: worktree || chat?.path || null, chat: chat || null,
+    };
+  }).sort((a, b) => (b.claimed || 0) - (a.claimed || 0));
+  chats.filter((h) => !used.has(h.id) && (h.open || now - h.seen < IDLE_CHAT_MIN * 60e3))
+    .sort((a, b) => b.seen - a.seen)
+    .forEach((h) => out.push({ ticket: h.ticket, label: h.label, role: h.role, worktree: h.path, chat: h }));
+  for (const r of out) {
+    const label = r.label || r.chat?.label;
+    const q = waiting.findIndex((w) => w.label === label);
+    const slots = heavy.filter((s) => label && s.label === label);
+    const holdsDb = !!label && db?.label === label;
+    r.locks = [...(holdsDb ? ['db'] : []), ...(q >= 0 ? [`db-wait ${q + 1}`] : []), ...slots.map((s) => `slot${s.slot}`)];
+    r.doing = r.chat?.doing || (slots[0] && `heavy: ${slots[0].cmd}`) || (holdsDb && `db lock: ${db.purpose}`)
+      || (q >= 0 && `waiting for the DB: ${waiting[q].purpose}`) || null;
+    // Quiet: the page offers the unclaim line, and the report leaves the chat out, so Greenhouse ends
+    // it rather than showing a closed chat as live. Its next gh-coord call brings it back.
+    const seen = r.chat ? r.chat.seen : r.claimed;
+    r.quiet = r.ticket && seen && !r.chat?.open && now - seen > QUIET_MIN * 60e3 ? now - seen : 0;
+  }
+  return out;
+}
+
+// The stage handoffs the log records. Merges to the integration branch come from git instead.
+const FLOW_EVENTS = {
+  'claim work': 'start', 'unclaim work': 'handoff', 'claim fix': 'changes', 'unclaim fix': 'fixed', 'claim merge': 'approved',
+};
+
+function history(now, current) {
+  const lines = readTail(path.join(STATE, 'log'), 256 * 1024).split('\n').map((l) => {
+    const m = l.match(/^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d) (.*)$/);
+    return m && { ts: localTime(m[1]), msg: m[2] };
+  }).filter(Boolean);
+  const from = now - TIMELINE_H * 3600e3;
+  const lanes = { db: [] };
+  for (let i = 1; i <= HEAVY_SLOTS; i++) lanes[`slot${i}`] = [];
+  const open = {};
+  const flows = { start: [], handoff: [], changes: [], fixed: [], approved: [] };
+  const close = (lane, ts, broke) => {
+    if (open[lane] && lanes[lane]) lanes[lane].push({ ...open[lane], end: ts, broke });
+    delete open[lane];
+  };
+  for (const { ts, msg } of lines) {
+    let m;
+    if ((m = msg.match(/^db ACQUIRE (\S+) \((.*)\) (\S+)$/))) { close('db', ts, false); open.db = { label: m[1], what: m[2], start: ts }; }
+    else if ((m = msg.match(/^db (RELEASE|BROKE)/))) close('db', ts, m[1] === 'BROKE');
+    else if ((m = msg.match(/^heavy ACQUIRE (slot\d+) (\S+) \((.*)\) (\S+)$/))) { close(m[1], ts, false); open[m[1]] = { label: m[2], what: m[3], start: ts }; }
+    else if ((m = msg.match(/^heavy (RELEASE|BROKE stale) (slot\d+)/))) close(m[2], ts, m[1] !== 'RELEASE');
+    else if ((m = msg.match(/^(claim|unclaim) (\S+) by \S+\/(work|fix|merge)$/)) && ts >= from) {
+      const event = FLOW_EVENTS[`${m[1]} ${m[3]}`];
+      if (event) flows[event].push({ ticket: m[2], ts });
+    }
+  }
+  // A hold with no release yet is live only if gh-coord still shows that holder.
+  if (open.db && current.db?.label === open.db.label) lanes.db.push({ ...open.db, end: now, live: true });
+  for (const s of current.heavy) {
+    const o = open[`slot${s.slot}`];
+    if (o && s.label === o.label) lanes[`slot${s.slot}`].push({ ...o, end: now, live: true });
+  }
+  return {
+    timeline: { from, lanes: Object.entries(lanes).map(([name, segs]) => ({ name, segs: segs.filter((g) => g.end >= from) })) },
+    log: lines.slice(-40).reverse(),
+    flows,
+  };
+}
+
+// docker and git are slow next to file reads, so each refreshes in the background: the stack on
+// gh-dash's timer (the report needs it), git only while the page asks for state. A db reset restarts the db container, so the stack only counts as down after STACK_GRACE_MS of failed checks.
+const stack = { text: LOCAL_STACK ? 'checking' : 'none (no local_stack in the greenhouse block)', dbs: null, at: 0, downSince: null, wasUp: false };
+function refreshStack() {
+  if (!LOCAL_STACK || Date.now() - stack.at < 5e3) return;
+  stack.at = Date.now();
+  execFile('docker', ['ps', '--format', '{{.Names}}'], { timeout: 5000 }, (err, out) => {
+    const dbs = err ? [] : out.split('\n').map((n) => n.match(/^supabase_db_(.+)$/)?.[1]).filter(Boolean);
+    stack.dbs = err ? null : dbs;
+    stack.text = err ? 'docker not answering' : dbs.length ? `up (${dbs.join(', ')})` : 'down';
+    stack.downSince = dbs.includes(LOCAL_STACK) ? null : stack.downSince || Date.now();
+    stack.wasUp = stack.wasUp || dbs.includes(LOCAL_STACK);
+  });
+}
+// What the report says. Like the page, a stack that was up still reads as up for its first
+// STACK_GRACE_MS gone, so a db reset doesn't report down and then up again.
+function stackState() {
+  if (!LOCAL_STACK) return 'none';
+  if (stack.dbs?.includes(LOCAL_STACK) || (stack.wasUp && Date.now() - stack.downSince <= STACK_GRACE_MS)) return 'up';
+  return stack.dbs?.length ? 'other' : 'down';
+}
+
+const midnight = () => new Date().setHours(0, 0, 0, 0);
+const TICKET_RE = new RegExp(`\\[(${KEY}-\\d+)\\]`);
+
+// Squash commits on origin/<base> since midnight or the timeline's start, whichever is earlier.
+// As fresh as the last fetch any chat made.
+const dev = { merged: [], error: null, at: 0 };
+function refreshDev() {
+  if (Date.now() - dev.at < 30e3) return;
+  dev.at = Date.now();
+  const since = new Date(Math.min(midnight(), Date.now() - TIMELINE_H * 3600e3)).toISOString();
+  execFile('git', ['-C', MAIN, 'log', `origin/${BASE}`, '--first-parent', `--since=${since}`, '--format=%ct%x09%s'],
+    { timeout: 5000 }, (err, out) => {
+      if (err) { dev.error = `no origin/${BASE} in ${MAIN}`; return; }
+      dev.error = null;
+      dev.merged = out.split('\n').filter(Boolean).map((l) => {
+        const [ct, subject] = l.split('\t');
+        return { ts: Number(ct) * 1000, subject, ticket: (subject.match(TICKET_RE) || [])[1] || null };
+      });
+    });
+}
+
+// CPU from os.cpus() deltas on a fixed 2s tick (3 minutes kept for the history strip).
+const cpu = { prev: null, pct: null, cores: [], hist: [] };
+function sampleCpu() {
+  const times = os.cpus().map((c) => c.times);
+  const busy = (t) => t.user + t.nice + t.sys + t.irq;
+  if (cpu.prev) {
+    cpu.cores = times.map((t, i) => {
+      const p = cpu.prev[i], d = busy(t) + t.idle - busy(p) - p.idle;
+      return d > 0 ? Math.round((busy(t) - busy(p)) / d * 100) : 0;
+    });
+    cpu.pct = Math.round(cpu.cores.reduce((a, b) => a + b, 0) / cpu.cores.length);
+    cpu.hist.push(cpu.pct);
+    if (cpu.hist.length > 90) cpu.hist.shift();
+  }
+  cpu.prev = times;
+}
+
+// Memory as Activity Monitor counts it (app + wired + compressed); os.freemem() on macOS only
+// counts never-used pages, so it reads near zero. Pressure is memory_pressure's "free percentage".
+const mach = { mem: null, swap: null, pressure: null, top: [], at: 0 };
+function refreshMachine() {
+  if (Date.now() - mach.at < 5e3) return;
+  mach.at = Date.now();
+  if (process.platform === 'darwin') {
+    execFile('vm_stat', { timeout: 3000 }, (err, out) => {
+      if (err) return;
+      const page = Number((out.match(/page size of (\d+)/) || [])[1] || 16384);
+      const n = (k) => Number((out.match(new RegExp(`${k}:\\s+(\\d+)`)) || [])[1] || 0) * page;
+      mach.mem = { total: os.totalmem(), used: n('Anonymous pages') - n('Pages purgeable') + n('Pages wired down') + n('Pages occupied by compressor') };
+    });
+    execFile('sysctl', ['-n', 'vm.swapusage', 'kern.memorystatus_level'], { timeout: 3000 }, (err, out) => {
+      if (err) return;
+      const [swap, level] = out.trim().split('\n');
+      const mb = (k) => Number((swap.match(new RegExp(`${k} = ([\\d.]+)M`)) || [])[1] || 0) * 2 ** 20;
+      mach.swap = { total: mb('total'), used: mb('used') };
+      mach.pressure = Number(level);
+    });
+  } else {
+    mach.mem = { total: os.totalmem(), used: os.totalmem() - os.freemem() };
+  }
+  // Grouped by name so a pile of vitest workers reads as one "node" line. Local only: never reported.
+  execFile('ps', ['-Ao', 'pcpu=,rss=,comm='], { timeout: 3000, maxBuffer: 8 << 20 }, (err, out) => {
+    if (err) return;
+    const groups = {};
+    for (const line of out.split('\n')) {
+      const m = line.trim().match(/^([\d.]+)\s+(\d+)\s+(.+)$/);
+      if (!m) continue;
+      const name = path.basename(m[3]);
+      const g = groups[name] || (groups[name] = { name, cpu: 0, rss: 0, n: 0 });
+      g.cpu += Number(m[1]); g.rss += Number(m[2]) * 1024; g.n++;
+    }
+    mach.top = Object.values(groups).sort((a, b) => b.cpu - a.cpu).slice(0, 6);
+  });
+}
+
+function machine() {
+  let disk = null;
+  try { const d = fs.statfsSync(os.homedir()); disk = { free: d.bavail * d.bsize, total: d.blocks * d.bsize }; } catch {}
+  return {
+    model: os.cpus()[0]?.model, ncpu: os.cpus().length, load: os.loadavg(), pct: cpu.pct, cores: cpu.cores, hist: cpu.hist,
+    mem: mach.mem, swap: mach.swap, pressure: mach.pressure, disk, top: mach.top,
+  };
+}
+
+// ── Starting chats ──────────────────────────────────────────────────────────
+
+function readMode() {
+  try { const m = fs.readFileSync(MODE_FILE, 'utf8').trim(); if (MODES.includes(m)) return m; } catch {}
+  return MODES[0];
+}
+
+// Every name gh-dash gives out stays taken for a day, in the state folder so a restart remembers it.
+// Open chats are found by their session files, and a chat that has none (some Claude Code builds,
+// folders under /tmp) never shows as open: this is what keeps its name from going out twice. A
+// closed chat keeps its number until the day is up, so numbers climb on a busy day.
+const NAME_HOLD_MS = 24 * 3600e3;
+function givenNames() {
+  const out = new Map();
+  let text = '';
+  try { text = fs.readFileSync(NAMES_FILE, 'utf8'); } catch {}
+  for (const line of text.split('\n')) {
+    const i = line.indexOf(' ');
+    const at = Number(line.slice(0, i));
+    if (i > 0 && Date.now() - at < NAME_HOLD_MS) out.set(line.slice(i + 1), at);
+  }
+  return out;
+}
+function holdName(name, hold = true) {
+  const names = givenNames();
+  if (hold) names.set(name, Date.now()); else names.delete(name);
+  try { fs.writeFileSync(NAMES_FILE, [...names].map(([n, at]) => `${at} ${n}\n`).join('')); } catch {}
+}
+
+// The lowest free name for `base`: loops are always numbered ("<key>-review 1", 2, ...), and a
+// ticket's first chat isn't ("<key>-129", then "<key>-129 2").
+const takenNames = (open) => new Set([...open.map((s) => s.name), ...givenNames().keys()]);
+function freeName(base, taken, numbered) {
+  if (!numbered && !taken.has(base)) return base;
+  let n = numbered ? 1 : 2;
+  while (taken.has(`${base} ${n}`)) n++;
+  return `${base} ${n}`;
+}
+const isNameOf = (name, base) => name === base || (String(name).startsWith(`${base} `) && /^\d+$/.test(name.slice(base.length + 1)));
+
+function nextLoopNames(open) {
+  const taken = takenNames(open);
+  return Object.fromEntries([...LOOPS, 'work'].map((loop) => [loop, freeName(`${key}-${loop}`, taken, true)]));
+}
+
+const sq = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+const appleString = (s) => `"${String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+const osascript = (lines, done) => execFile('osascript', lines.flatMap((l) => ['-e', l]), { timeout: 15000 }, (err) => done(err));
+
+function openTerminal(command, done) {
+  osascript(TERMINAL === 'iterm'
+    ? ['tell application "iTerm2"', 'activate', 'if (count of windows) = 0 then', 'create window with default profile', 'else',
+      'tell current window to create tab with default profile', 'end if', `tell current session of current window to write text ${appleString(command)}`, 'end tell']
+    : ['tell application "Terminal"', 'activate', `do script ${appleString(command)}`, 'end tell'], done);
+}
+
+// Claude Code puts the chat's name in the terminal title, so the window can be found by it.
+function focusTerminal(name, done) {
+  osascript(TERMINAL === 'iterm'
+    ? ['tell application "iTerm2"', 'activate', 'repeat with w in windows', 'repeat with t in tabs of w',
+      `if name of current session of t contains ${appleString(name)} then`, 'select t', 'select w', 'end if', 'end repeat', 'end repeat', 'end tell']
+    : ['tell application "Terminal"', 'activate', 'repeat with w in windows',
+      `if name of w contains ${appleString(name)} then set index of w to 1`, 'end repeat', 'end tell'], done);
+}
+
+function openInVscode(query) {
+  // The link opens in whichever VS Code window was used last, so bring this repo's window forward first.
+  execFile('code', [MAIN], { timeout: 10000 }, () => setTimeout(() => {
+    execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [`vscode://anthropic.claude-code/open?${query}`]);
+  }, 600));
+}
+
+// A record for the chat before it ever calls gh-coord, so its card shows at once and a chat that
+// never gets going (an untrusted folder, a startup dialog) shows as stuck. gh-coord keeps these keys.
+function preRecord(id, name, mode, kind, ticket) {
+  const stamp = new Date().toLocaleString('sv-SE').slice(0, 19);
+  const lines = [`since=${stamp}`, 'started_by=gh-dash', `started=${Math.floor(Date.now() / 1000)}`, `name=${name}`, `mode=${mode}`];
+  // tend never claims, so the record carries its ticket itself.
+  if (kind === 'tend' && ticket) lines.push(`ticket=${KEY}-${ticket}`, 'role=tend');
+  const record = path.join(STATE, 'chats', id);
+  try {
+    fs.writeFileSync(record, lines.join('\n') + '\n');
+    fs.mkdirSync(path.join(MARKERS, 'starting'), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(MARKERS, 'starting', id), record);
+  } catch {}
+}
+
+// With a ticket number, the skill runs once on that ticket. Without one, review, fix and merge start
+// a numbered 5-minute loop, and work picks the next tended ticket.
+function start(kind, ticket, mode, done) {
+  if (!KINDS.includes(kind)) return done({ error: `unknown start: ${kind}` });
+  if (!MODES.includes(mode)) return done({ error: `unknown mode: ${mode}` });
+  if (kind === 'tend' && !ticket) return done({ error: 'enter a ticket number to tend' });
+  const open = openChats();
+  let name, run;
+  if (ticket) {
+    const base = kind === 'work' ? `${key}-${ticket}` : `${key}-${ticket} ${kind}`;
+    run = kind === 'tend' ? `/greenhouse:tend-ticket ${KEY}-${ticket}` : `/greenhouse:loop-${kind} ${KEY}-${ticket}`;
+    // An open chat on this ticket and kind ("<key>-129", "<key>-129 2", ...) comes forward instead.
+    const already = open.find((s) => isNameOf(s.name, base));
+    if (already) {
+      name = already.name;
+      if (already.kind === 'bg') return done({ name, already: true, attach: `claude attach ${name}` });
+      if (String(already.entrypoint).includes('vscode')) openInVscode(`session=${encodeURIComponent(already.sessionId)}`);
+      else if (process.platform === 'darwin') focusTerminal(name, () => {});
+      return done({ name, already: true });
+    }
+    name = freeName(base, takenNames(open), false);
+  } else {
+    name = nextLoopNames(open)[kind];
+    run = kind === 'work' ? '/greenhouse:loop-work' : `/loop 5m /greenhouse:loop-${kind}`;
+  }
+  holdName(name);
+  if (mode === 'vscode') {
+    openInVscode(`prompt=${encodeURIComponent(run)}`);
+    return done({ name, run, mode, enter: true });
+  }
+  if (mode === 'terminal') {
+    const id = randomUUID();
+    preRecord(id, name, mode, kind, ticket);
+    const plugin = PLUGIN_DIR ? `--plugin-dir ${sq(PLUGIN_DIR)} ` : '';
+    const command = `cd ${sq(MAIN)} && claude ${plugin}-n ${sq(name)} --session-id ${id} --remote-control ${sq(name)} ${sq(run)}`;
+    return openTerminal(command, (err) => {
+      if (err) { holdName(name, false); try { fs.unlinkSync(path.join(STATE, 'chats', id)); } catch {} return done({ error: `couldn't open ${TERMINAL}: ${err.message.split('\n')[0]}` }); }
+      done({ name, run, mode });
+    });
+  }
+  // background: --bg picks its own session id and prints the short form.
+  const plugin = PLUGIN_DIR ? ['--plugin-dir', PLUGIN_DIR] : [];
+  execFile('claude', ['--bg', ...plugin, '-n', name, '--remote-control', name, run], { cwd: MAIN, timeout: 60000 }, (err, out) => {
+    if (err) { holdName(name, false); return done({ error: `claude --bg failed: ${String(err.message).split('\n')[0]}` }); }
+    const short = (String(out).match(/backgrounded\s*·\s*([0-9a-f]{8})/) || [])[1];
+    if (short) {
+      execFile('claude', ['agents', '--json'], { timeout: 8000, maxBuffer: 4 << 20 }, (e, list) => {
+        try { const a = JSON.parse(list).find((x) => String(x.sessionId).startsWith(short)); if (a) preRecord(a.sessionId, name, mode, kind, ticket); } catch {}
+      });
+    }
+    done({ name, run, mode, attach: `claude attach ${name}` });
+  });
+}
+
+// ── Greenhouse: reporting and the start queue ───────────────────────────────
+
+const gh = { creds: null, credsAt: 0, lastSent: 0, lastTry: 0, lastKey: '', state: 'starting', error: null, errorAt: 0, busy: false, polling: false, again: false, started: [], backoffUntil: 0, lastQueueCheck: 0 };
+// Answers that won't change on their own: a Greenhouse whose migration hasn't deployed (404), a
+// project this token can't reach (403), or a machine name or snapshot the server refuses (400).
+// Ask again in five minutes rather than every few seconds.
+const BACKOFF_MS = 5 * 60e3;
+function backOff(r, fn) {
+  if (![400, 403, 404].includes(r.status)) return false;
+  gh.backoffUntil = Date.now() + BACKOFF_MS;
+  gh.state = 'error';
+  ghError(r.status === 404
+    ? `${fn} isn't on this Greenhouse yet (its migration hasn't deployed); trying again in 5 minutes`
+    : `${fn} refused (HTTP ${r.status}) ${(r.body && r.body.message) || ''}; trying again in 5 minutes`);
+  return true;
+}
+
+function ghError(msg) {
+  gh.error = msg;
+  if (Date.now() - gh.errorAt > 60e3) { console.error(`gh-dash: ${msg}`); gh.errorAt = Date.now(); }
+}
+
+// gh-jwt caches the session token and refreshes it near expiry, so asking it every minute is cheap.
+function credentials(cb) {
+  if (gh.creds && Date.now() - gh.credsAt < 60e3) return cb(gh.creds);
+  execFile(path.join(BIN, 'gh-jwt'), [], { timeout: 30000 }, (err, out) => {
+    if (err) { gh.creds = null; gh.state = 'off'; ghError('no Greenhouse token on this machine: run /greenhouse:setup'); return cb(null); }
+    const env = {};
+    for (const m of String(out).matchAll(/^export (\w+)='([^']*)'$/gm)) env[m[1]] = m[2];
+    gh.creds = env.GREENHOUSE_URL && env.GREENHOUSE_JWT ? env : null;
+    gh.credsAt = Date.now();
+    cb(gh.creds);
+  });
+}
+
+async function rpc(fn, body) {
+  const c = await new Promise((resolve) => credentials(resolve));
+  if (!c) return { ok: false, status: 0, body: null };
+  const res = await fetch(`${c.GREENHOUSE_URL}/rest/v1/rpc/${fn}`, {
+    method: 'POST',
+    headers: { apikey: c.GREENHOUSE_PUBLIC_KEY, Authorization: `Bearer ${c.GREENHOUSE_JWT}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(5000),
+  });
+  const text = await res.text();
+  let parsed = null;
+  try { parsed = text ? JSON.parse(text) : null; } catch {}
+  return { ok: res.ok, status: res.status, body: parsed, text };
+}
+
+// What the report reads: the locks and the chat rows, never the page's log history, timeline or
+// gauges, so a tick with no page open reads only the coordinator's files and the open chats.
+function reportState() {
+  const now = Date.now();
+  const current = locks(now);
+  return { ...current, rows: rows(now, current) };
+}
+
+// Exactly what leaves the machine: who is running what. No transcript or prompt text, no paths
+// beyond a folder name, no process list, no gauges, and commands with env values stripped.
+function reportPayload(s) {
+  return {
+    p_project_id: PROJECT_ID,
+    p_machine: MACHINE,
+    p_machine_state: {
+      slots_total: HEAVY_SLOTS,
+      heavy_slots: s.heavy.filter((h) => h.held).map((h) => ({ slot: h.slot, label: h.label || null, cmd: sanitize(h.cmd) })),
+      db_holder: s.db ? s.db.label || null : null,
+      db_doing: s.db ? sanitize(s.db.purpose) : null,
+      db_waiters: s.waiting.map((w) => w.label),
+      stack: stackState(),
+      start_mode: readMode(),
+    },
+    p_chats: s.rows.filter((r) => r.chat && !r.quiet).map((r) => ({
+      session_id: r.chat.id,
+      name: r.chat.name ? String(r.chat.name).slice(0, 120) : null,
+      ticket: r.ticket || null,
+      role: ROLES.includes(r.role) ? r.role : null,
+      doing: sanitize(r.doing),
+      needs_you: r.chat.needs,
+      folder: base(r.worktree || r.chat.path),
+      started_at: iso(r.chat.since),
+    })),
+  };
+}
+
+// Only when something visible changed, at most every 10 s, failed tries included. There's no
+// heartbeat: the queue check below keeps "last seen" fresh. The server ignores a report under 5 s
+// after the last and returns false; then this simply tries again on a later tick.
+async function reportTick() {
+  if (gh.busy || !PROJECT_ID || Date.now() < gh.backoffUntil) { if (!PROJECT_ID) gh.state = 'off'; return; }
+  const payload = reportPayload(reportState());
+  const key = JSON.stringify(payload);
+  if (key === gh.lastKey || Date.now() - gh.lastTry < 10e3) return;
+  gh.busy = true;
+  gh.lastTry = Date.now();
+  try {
+    const r = await rpc('report_agent_state', payload);
+    if (r.ok) {
+      gh.lastSent = Date.now();
+      if (r.body === true) { gh.lastKey = key; gh.state = 'reporting'; gh.error = null; }
+    } else if (backOff(r, 'report_agent_state')) { /* backed off */ }
+    else if (r.status) { gh.state = 'error'; ghError(`report_agent_state failed (HTTP ${r.status}) ${(r.body && r.body.message) || ''}`.trim()); }
+  } catch (e) { gh.state = 'error'; ghError(`report_agent_state failed: ${e.message}`); }
+  finally { gh.busy = false; }
+}
+
+// A clean stop: every chat on this machine ends and it shows as stopped, rather than waiting ten
+// silent minutes to read as offline.
+async function stopReport() {
+  if (!PROJECT_ID || !gh.creds) return;
+  try { await rpc('report_agent_state', { ...reportPayload(reportState()), p_chats: [], p_stopping: true }); } catch {}
+}
+
+// Requests queued from a ticket page for this machine, taken until none is left. VS Code mode needs
+// someone at the keyboard to press Enter, so queued starts always run in terminal (or background,
+// when that's the mode). A nudge that arrives while a start runs asks for another pass, so a second
+// request queued meanwhile is taken right after, not at the next safety-net check.
+async function queueTick() {
+  if (!PROJECT_ID || !gh.creds || Date.now() < gh.backoffUntil) return;
+  if (gh.polling) { gh.again = true; return; }
+  gh.polling = true;
+  try {
+    let req;
+    do {
+      gh.again = false;
+      gh.lastQueueCheck = Date.now();
+      const r = await rpc('take_agent_start', { p_project_id: PROJECT_ID, p_machine: MACHINE });
+      if (!r.ok && backOff(r, 'take_agent_start')) return;
+      req = r.ok && Array.isArray(r.body) ? r.body[0] : null;
+      if (req) {
+        const mode = readMode() === 'background' || !MODES.includes('terminal') ? 'background' : 'terminal';
+        const ticket = req.ticket_number ? String(req.ticket_number) : '';
+        const out = await new Promise((resolve) => start(req.kind, ticket, mode, resolve));
+        gh.started.unshift({ at: Date.now(), kind: req.kind, ticket, name: out.name, error: out.error || null });
+        gh.started.length = Math.min(gh.started.length, 5);
+        await rpc('finish_agent_start', { p_id: req.id, p_status: out.error ? 'failed' : 'done', p_reason: out.error || (out.already ? `${out.name} was already open` : null) });
+      }
+    } while (req || gh.again);
+  } catch (e) { ghError(`take_agent_start failed: ${e.message}`); }
+  finally { gh.polling = false; }
+}
+
+// Starts pushed from Greenhouse. gh-dash joins one private Realtime topic, agents-queue:<username>,
+// which only that person can join, and checks the queue when nudged and whenever it (re)joins.
+// Realtime's JSON protocol (vsn 1.0.0) by hand: a plugin ships no node_modules. The safety-net
+// check runs every 4 minutes while joined (it also stamps "last seen"), and every 60 s when the
+// socket can't connect.
+const rt = { ws: null, joined: false, ref: 0, joinRef: null, topic: null, token: null, beat: null, retryMs: 5e3, closing: false };
+
+function rtSend(event, payload, topic = rt.topic, joinRef = rt.joinRef) {
+  if (rt.ws && rt.ws.readyState === 1) rt.ws.send(JSON.stringify({ topic, event, payload, ref: String(++rt.ref), join_ref: joinRef }));
+}
+
+function rtConnect() {
+  if (rt.closing || rt.ws) return;
+  credentials((c) => {
+    if (!c || !c.GREENHOUSE_TEAM_USERNAME || typeof WebSocket !== 'function') { setTimeout(rtConnect, 60e3); return; }
+    const url = `${c.GREENHOUSE_URL.replace(/^http/, 'ws')}/realtime/v1/websocket?apikey=${encodeURIComponent(c.GREENHOUSE_PUBLIC_KEY)}&vsn=1.0.0`;
+    const ws = new WebSocket(url);
+    rt.ws = ws;
+    rt.topic = `realtime:agents-queue:${c.GREENHOUSE_TEAM_USERNAME}`;
+    rt.token = c.GREENHOUSE_JWT;
+    ws.addEventListener('open', () => {
+      rt.joinRef = String(++rt.ref);
+      ws.send(JSON.stringify({
+        topic: rt.topic, event: 'phx_join', ref: rt.joinRef, join_ref: rt.joinRef,
+        payload: { config: { broadcast: { self: false }, presence: { key: '', enabled: false }, postgres_changes: [], private: true }, access_token: rt.token },
+      }));
+      rt.beat = setInterval(() => rtSend('heartbeat', {}, 'phoenix', null), 25e3);
+    });
+    ws.addEventListener('message', (e) => {
+      let m;
+      try { m = JSON.parse(e.data); } catch { return; }
+      if (m.topic !== rt.topic) return;
+      if (m.event === 'phx_reply' && m.ref === rt.joinRef) {
+        if (m.payload && m.payload.status === 'ok') { rt.joined = true; rt.retryMs = 5e3; void queueTick(); }
+        else { ghError(`realtime: couldn't join the queue topic: ${JSON.stringify((m.payload && m.payload.response) || {})}`); ws.close(); }
+      } else if (m.event === 'broadcast' && m.payload && m.payload.event === 'start-queued') {
+        void queueTick();
+      } else if (m.event === 'phx_close' || m.event === 'phx_error') {
+        ws.close();
+      }
+    });
+    ws.addEventListener('close', () => {
+      clearInterval(rt.beat);
+      rt.ws = null;
+      rt.joined = false;
+      if (rt.closing) return;
+      setTimeout(rtConnect, rt.retryMs);
+      rt.retryMs = Math.min(rt.retryMs * 2, 60e3);
+    });
+    ws.addEventListener('error', () => {});
+  });
+}
+
+// gh-jwt refreshes the session token near expiry; hand the new one to the socket.
+function rtRefreshToken() {
+  if (!rt.joined) return;
+  credentials((c) => {
+    if (c && c.GREENHOUSE_JWT !== rt.token) { rt.token = c.GREENHOUSE_JWT; rtSend('access_token', { access_token: rt.token }); }
+  });
+}
+
+function queueSafetyNet() {
+  if (Date.now() - gh.lastQueueCheck >= (rt.joined ? 4 * 60e3 : 60e3)) void queueTick();
+}
+
+// ── Server ──────────────────────────────────────────────────────────────────
+
+let PORT = BASE_PORT;
+
+function snapshot() {
+  const now = Date.now();
+  const current = locks(now);
+  const hist = history(now, current);
+  hist.flows.landed = dev.merged.filter((m) => m.ts >= hist.timeline.from)
+    .map((m) => ({ ticket: m.ticket || '-', ts: m.ts })).sort((a, b) => a.ts - b.ts);
+  return {
+    now, key, KEY, base: BASE, machineName: MACHINE, localStack: LOCAL_STACK,
+    stack: stack.text, stackDown: !!LOCAL_STACK && !!stack.downSince && now - stack.downSince > STACK_GRACE_MS,
+    dev: { merged: dev.merged.filter((m) => m.ts >= midnight()), error: dev.error },
+    ...current, rows: rows(now, current), ...hist, machine: machine(), starts: nextLoopNames(openChats()),
+    modes: MODES, mode: readMode(),
+    greenhouse: { state: gh.state, lastSent: gh.lastSent || null, error: gh.error, started: gh.started, live: rt.joined },
+  };
+}
+
+function readBody(req, cb) {
+  let body = '';
+  req.on('data', (c) => { body += c; if (body.length > 1024) req.destroy(); });
+  req.on('end', () => { let q = {}; try { q = JSON.parse(body); } catch {} cb(q); });
+}
+
+const server = http.createServer((req, res) => {
+  // Only answer to our own hostnames: chat state stays off-limits to pages that rebind DNS.
+  if (![`127.0.0.1:${PORT}`, `localhost:${PORT}`].includes(req.headers.host)) { res.writeHead(403); return res.end(); }
+  const json = (code, o) => { res.writeHead(code, { 'content-type': 'application/json', 'cache-control': 'no-store' }); res.end(JSON.stringify(o)); };
+  if (req.url === '/api/state') {
+    refreshStack(); refreshDev(); refreshMachine(); refreshAgents();
+    return json(200, snapshot());
+  }
+  if ((req.url === '/api/start' || req.url === '/api/mode') && req.method === 'POST') {
+    // Only this page can start chats: a form on another site can't set this header, and another
+    // site's fetch with it needs a CORS preflight this server never answers.
+    if (req.headers['x-gh-dash'] !== '1') { res.writeHead(403); return res.end(); }
+    return readBody(req, (q) => {
+      if (req.url === '/api/mode') {
+        if (!MODES.includes(q.mode)) return json(400, { error: `unknown mode: ${q.mode}` });
+        try { fs.writeFileSync(MODE_FILE, `${q.mode}\n`); } catch (e) { return json(500, { error: e.message }); }
+        return json(200, { mode: q.mode });
+      }
+      start(String(q.kind), /^\d{1,6}$/.test(q.ticket) ? q.ticket : '', readMode(), (out) => json(out.error ? 400 : 200, out));
+    });
+  }
+  if (req.url === '/') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
+    return res.end(PAGE);
+  }
+  res.writeHead(404); res.end();
+});
+
+function running() {
+  try {
+    const pid = Number(fs.readFileSync(PID_FILE, 'utf8'));
+    const port = Number(fs.readFileSync(PORT_FILE, 'utf8'));
+    return pid && pid !== process.pid && alive(pid) ? { pid, port } : null;
+  } catch { return null; }
+}
+const openBrowser = (url) => execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [url]);
+
+function listen(port, tries) {
+  server.once('error', (e) => {
+    if (e.code === 'EADDRINUSE' && tries > 0) return listen(port + 1, tries - 1);
+    console.error(`gh-dash: ${e.message}`);
+    process.exit(1);
+  });
+  server.listen(port, '127.0.0.1', () => {
+    PORT = port;
+    fs.writeFileSync(PID_FILE, String(process.pid));
+    fs.writeFileSync(PORT_FILE, String(port));
+    // Only the stack feeds the report. The page's own readings (git, processes, memory, Claude's
+    // busy/idle) refresh when it asks for state, so nothing spawns while nobody has it open.
+    refreshStack();
+    sampleCpu(); setInterval(sampleCpu, 2000);
+    setInterval(() => { refreshStack(); void reportTick(); }, 2000);
+    setInterval(queueSafetyNet, 5000);
+    setInterval(rtRefreshToken, 60e3);
+    rtConnect();
+    const url = `http://127.0.0.1:${port}`;
+    console.log(`gh-dash: ${url}  (${KEY}, reading ${STATE}, machine ${MACHINE})`);
+    if (ARGS.includes('--open')) openBrowser(url);
+  });
+}
+
+function cleanup() {
+  try { if (Number(fs.readFileSync(PID_FILE, 'utf8')) === process.pid) { fs.unlinkSync(PID_FILE); fs.unlinkSync(PORT_FILE); } } catch {}
+}
+
+if (process.env.GREENHOUSE_ENV_PROBE) {
+  // Test hook (plugin/tests/gh-coord.test.sh): what a started chat would inherit from gh-dash.
+  const left = Object.keys(process.env).filter((n) => n === 'CLAUDECODE' || n.startsWith('CLAUDE_CODE_'));
+  if (left.length) console.error(left.join(' '));
+}
+if (ARGS.includes('--report-preview')) {
+  // One stack check (the report's only spawned reading), then print the payload. No network.
+  refreshStack();
+  setTimeout(() => { console.log(JSON.stringify(reportPayload(reportState()), null, 2)); process.exit(0); }, 2500);
+} else {
+  const already = running();
+  if (already) {
+    console.log(`gh-dash: already running for ${KEY} at http://127.0.0.1:${already.port} (pid ${already.pid})`);
+    if (ARGS.includes('--open')) openBrowser(`http://127.0.0.1:${already.port}`);
+  } else if (ARGS.includes('--detach')) {
+    const log = fs.openSync(LOG_FILE, 'a');
+    spawn(process.execPath, [__filename, ...ARGS.filter((a) => a !== '--detach')], { detached: true, stdio: ['ignore', log, log], cwd: MAIN }).unref();
+    const until = Date.now() + 5000;
+    (function wait() {
+      const r = running();
+      if (r) { console.log(`gh-dash: started for ${KEY} at http://127.0.0.1:${r.port} (log ${LOG_FILE})`); process.exit(0); }
+      if (Date.now() > until) { console.log(`gh-dash: starting in the background; see ${LOG_FILE}`); process.exit(0); }
+      setTimeout(wait, 200);
+    })();
+  } else {
+    process.on('exit', cleanup);
+    // A clean stop tells Greenhouse (at most 3 s), so the machine's chats end at once.
+    const shutdown = () => {
+      rt.closing = true;
+      try { if (rt.ws) rt.ws.close(); } catch {}
+      setTimeout(() => process.exit(0), 3000);
+      void stopReport().finally(() => process.exit(0));
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
+    listen(BASE_PORT, 9);
+  }
+}
+
+// The page's script uses no template literals or ${, so String.raw passes it through untouched.
+const PAGE = String.raw`<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gh-dash</title>
+<style>
+  :root {
+    --bg: #070a09; --panel: #0b100e; --inset: #050706; --line: #19231f; --line2: #26332d;
+    --fg: #b4c4b8; --dim: #56645b; --hi: #e2ece4;
+    --g: #6ee787; --a: #ffb547; --r: #ff5f56;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); }
+  body {
+    font: 12.5px/1.55 ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    padding: 18px 16px 48px; max-width: 1360px; margin: 0 auto;
+  }
+  body::before {
+    content: ""; position: fixed; inset: 0; pointer-events: none; z-index: 10;
+    background: repeating-linear-gradient(0deg, rgba(255, 255, 255, .018) 0 1px, transparent 1px 3px);
+  }
+  .g { color: var(--g); } .a { color: var(--a); } .r { color: var(--r); } .d { color: var(--dim); } .hi { color: var(--hi); }
+
+  .top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px 24px; padding-bottom: 12px; border-bottom: 1px solid var(--line2); }
+  .ident { flex: 1 1 280px; }
+  .gauges { flex: 0 1 690px; display: flex; flex-wrap: wrap; gap: 10px; }
+  .gauge { flex: 1 1 300px; min-width: 0; background: var(--panel); border: 1px solid var(--line2); padding: 7px 9px; }
+  .gauge .row { display: flex; align-items: baseline; gap: 8px; white-space: nowrap; }
+  .gauge .val { color: var(--hi); font-size: 15px; line-height: 1; font-variant-numeric: tabular-nums; }
+  .gauge .sm { margin-left: auto; color: var(--dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
+  .gauge .foot { justify-content: space-between; color: var(--dim); font-size: 11px; margin-top: 2px; }
+  .gauge .meter { margin: 8px 0 6px; }
+  .cmd { color: var(--g); font-size: 15px; }
+  .cursor { display: inline-block; width: .6em; height: 1.1em; background: var(--g); vertical-align: -2px; animation: blink 1.1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  /* The ticket number is typed straight into the prompt: no box, no native caret, the block cursor
+     follows the digits (the script sizes the input to them). */
+  .cmd { cursor: text; }
+  .cmd input { font: inherit; line-height: inherit; vertical-align: baseline; color: inherit; background: none; border: 0; padding: 0; margin: 0; width: 0; caret-color: transparent; outline: none; }
+  .cmd:focus-within .cursor { box-shadow: 0 0 8px var(--g); }
+  .launch { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 8px; font-size: 11px; }
+  .launch button, .modes button { font: inherit; color: var(--fg); background: none; border: 1px solid var(--g); padding: 0 7px; line-height: 18px; letter-spacing: .08em; cursor: pointer; }
+  .launch button:not(:disabled):hover, .launch button:focus-visible, .modes button:hover, .modes button:focus-visible { color: var(--g); background: rgba(110, 231, 135, .08); box-shadow: inset 0 0 10px rgba(110, 231, 135, .14); outline: none; }
+  .launch button:disabled { opacity: .35; cursor: default; }
+  .modes { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 6px; font-size: 11px; }
+  .modes button { border-color: var(--line2); color: var(--dim); }
+  .modes button.on { border-color: var(--g); color: var(--g); background: rgba(110, 231, 135, .08); }
+  .hint { min-height: 1.55em; margin-top: 3px; font-size: 11px; }
+  .status { text-align: right; letter-spacing: .1em; font-size: 11px; }
+  #clock { color: var(--hi); font-size: 20px; letter-spacing: .08em; font-variant-numeric: tabular-nums; }
+
+  .alerts { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 6px; margin: 14px 0 4px; }
+  .tile { border: 1px solid var(--line2); background: var(--inset); color: var(--dim); text-align: center; padding: 8px 6px; font-size: 11px; letter-spacing: .16em; }
+  .tile.on-a { color: var(--a); border-color: var(--a); background: rgba(255, 181, 71, .1); box-shadow: inset 0 0 14px rgba(255, 181, 71, .16); }
+  .tile.on-g { color: var(--g); border-color: var(--g); background: rgba(110, 231, 135, .08); box-shadow: inset 0 0 14px rgba(110, 231, 135, .14); }
+  .tile.on-r { color: var(--r); border-color: var(--r); background: rgba(255, 95, 86, .14); box-shadow: inset 0 0 14px rgba(255, 95, 86, .2); animation: alarm 1s steps(1) infinite; }
+  @keyframes alarm { 50% { background: transparent; box-shadow: none; } }
+
+  .label { display: flex; align-items: center; gap: 12px; color: var(--dim); font-size: 11px; letter-spacing: .14em; margin: 22px 0 9px; white-space: nowrap; min-width: 0; }
+  .label span { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+  .label::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+  .label b { color: var(--hi); font-weight: 600; letter-spacing: .2em; }
+
+  .mimic { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr) 42px) minmax(0, 1fr); }
+  #st-idle { grid-area: 1 / 1; } #f-start { grid-area: 1 / 2; } #st-work { grid-area: 1 / 3; } #f-handoff { grid-area: 1 / 4; }
+  #st-review { grid-area: 1 / 5; } .vflows { grid-area: 2 / 5; } #st-fix { grid-area: 3 / 3 / 4 / 8; min-height: 0; }
+  #f-approved { grid-area: 1 / 6; } #st-merge { grid-area: 1 / 7; } #f-landed { grid-area: 1 / 8; }
+  /* The integration branch spans the stage row, the arrows and the fix row. contain: size keeps its
+     list out of the row sizing, so the stage row grows with the busiest stage and the merges scroll. */
+  #st-dev { grid-area: 1 / 9 / 4 / 10; contain: size; display: flex; flex-direction: column; }
+  #st-dev .cards { flex: 1; min-height: 0; overflow-y: auto; align-content: start; scrollbar-width: thin; scrollbar-color: var(--line2) transparent; }
+  #st-fix .cards { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+
+  .stage, .panel { background: var(--panel); border: 1px solid var(--line2); }
+  .stage { min-height: 140px; transition: border-color .4s, box-shadow .4s; }
+  .stage.live { border-color: rgba(110, 231, 135, .5); box-shadow: 0 0 20px rgba(110, 231, 135, .07); }
+  .stage > header, .panel > header { display: flex; align-items: baseline; gap: 8px; padding: 7px 9px; border-bottom: 1px solid var(--line); background: var(--inset); }
+  .desig { color: var(--dim); font-size: 10px; letter-spacing: .1em; }
+  .name { color: var(--hi); font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+  .sub { color: var(--dim); }
+  .count { margin-left: auto; font-size: 20px; line-height: 1; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .stage.live .count { color: var(--g); text-shadow: 0 0 8px rgba(110, 231, 135, .55); }
+  .cards { padding: 8px; display: grid; grid-template-columns: minmax(0, 1fr); gap: 6px; }
+  .empty { color: var(--dim); padding: 4px 2px; }
+
+  .card { border: 1px solid var(--line); border-left: 3px solid var(--line2); background: var(--inset); padding: 6px 8px; min-width: 0; }
+  .card.s-run, .card.s-act { border-left-color: var(--g); }
+  .card.s-wait { border-left-color: var(--a); }
+  .card.s-need { border-left-color: var(--a); border-color: rgba(255, 181, 71, .5); }
+  .card-top { display: flex; align-items: center; gap: 7px; }
+  .lamp { width: 8px; height: 8px; border-radius: 50%; background: var(--line2); flex: none; }
+  .st { font-size: 10px; letter-spacing: .12em; color: var(--dim); font-weight: 600; }
+  .s-run .lamp { background: var(--g); box-shadow: 0 0 7px var(--g); }
+  .s-act .lamp { background: var(--g); }
+  .s-held .lamp { background: var(--a); box-shadow: 0 0 7px var(--a); }
+  .s-wait .lamp, .s-need .lamp { background: var(--a); box-shadow: 0 0 7px var(--a); animation: blink 1.4s steps(1) infinite; }
+  .card.s-quiet { border-left-color: var(--a); opacity: .7; }
+  .s-quiet .lamp { background: var(--a); }
+  .s-quiet .st { color: var(--a); }
+  .card-name { margin-top: 2px; color: var(--fg); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card-fix { margin-top: 3px; color: var(--a); font-size: 11px; overflow-wrap: anywhere; }
+  .s-alarm .lamp { background: var(--r); box-shadow: 0 0 7px var(--r); animation: blink .8s steps(1) infinite; }
+  .s-run .st, .s-act .st { color: var(--g); } .s-held .st, .s-wait .st, .s-need .st { color: var(--a); } .s-alarm .st { color: var(--r); }
+  .tk { color: var(--hi); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .age { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .card-do { margin-top: 3px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; }
+  .card-meta { margin-top: 4px; color: var(--dim); font-size: 11px; display: flex; flex-wrap: wrap; gap: 3px 8px; align-items: center; }
+  .tag { border: 1px solid currentColor; padding: 0 4px; font-size: 10px; letter-spacing: .08em; line-height: 15px; }
+  .lampx { display: inline-flex; align-items: center; gap: 6px; }
+
+  .flow { --c: var(--line2); display: flex; align-items: center; gap: 4px; min-width: 0; }
+  .flow.lit { --c: rgba(110, 231, 135, .5); }
+  .flow.hot { --c: var(--g); }
+  .flow .n { font-size: 10px; line-height: 12px; min-height: 12px; color: var(--g); font-variant-numeric: tabular-nums; }
+  .pipe { position: relative; flex: none; background: var(--c); }
+  .pipe::after { content: ""; position: absolute; }
+  .flow.h { flex-direction: column; align-items: stretch; align-self: start; margin-top: 3px; padding: 0 10px 0 2px; }
+  .flow.h .n { text-align: center; }
+  .flow.h .pipe { height: 6px; }
+  .flow.h .pipe::after { right: -8px; top: 50%; transform: translateY(-50%); border-top: 7px solid transparent; border-bottom: 7px solid transparent; border-left: 8px solid var(--c); }
+  .vflows { display: flex; justify-content: center; gap: 30px; margin: 12px 0; }
+  .flow.v .pipe { width: 6px; height: 26px; }
+  .flow.v .pipe::after { left: 50%; transform: translateX(-50%); border-left: 7px solid transparent; border-right: 7px solid transparent; }
+  .flow.down .pipe::after { bottom: -8px; border-top: 8px solid var(--c); }
+  .flow.up .pipe::after { top: -8px; border-bottom: 8px solid var(--c); }
+  .flow.down .n { order: -1; }
+  .flow.hot.h .pipe { background: repeating-linear-gradient(90deg, var(--g) 0 8px, rgba(110, 231, 135, .16) 8px 14px); background-size: 14px 100%; animation: flow-x .8s linear infinite; }
+  .flow.hot.v .pipe { background: repeating-linear-gradient(180deg, var(--g) 0 8px, rgba(110, 231, 135, .16) 8px 14px); background-size: 100% 14px; animation: flow-y .8s linear infinite; }
+  .flow.hot.up .pipe { animation-direction: reverse; }
+  @keyframes flow-x { to { background-position: 14px 0; } }
+  @keyframes flow-y { to { background-position: 0 14px; } }
+
+  .merge { display: flex; gap: 8px; padding: 1px 0; min-width: 0; white-space: nowrap; }
+  .merge .hi { flex: none; }
+  .merge .subj { flex: 1 1 auto; color: var(--dim); overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
+  .systems { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 10px; }
+  .panel .body { padding: 9px 10px; }
+  .line { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: center; margin: 3px 0; }
+  .meter { display: flex; gap: 2px; margin: 4px 0 2px; }
+  .meter i { flex: 1; height: 8px; background: var(--line); }
+  .meter i.on { background: var(--g); box-shadow: 0 0 4px rgba(110, 231, 135, .5); }
+  .meter.hot i.on { background: var(--a); box-shadow: 0 0 4px rgba(255, 181, 71, .5); }
+  .k { color: var(--dim); font-size: 10px; letter-spacing: .14em; min-width: 7ch; }
+
+  .cores { display: flex; gap: 3px; height: 22px; margin: 7px 0 4px; }
+  .cores i { flex: 1; position: relative; background: var(--line); }
+  .cores b { position: absolute; left: 0; right: 0; bottom: 0; background: var(--g); box-shadow: 0 0 4px rgba(110, 231, 135, .4); }
+  .spark { display: flex; align-items: flex-end; gap: 1px; height: 14px; border-bottom: 1px solid var(--line); }
+  .spark i { flex: 1; background: rgba(110, 231, 135, .55); }
+  .cores b.hot, .spark i.hot { background: var(--a); box-shadow: none; }
+  .procs { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 6px; }
+  .proc { background: var(--panel); border: 1px solid var(--line2); padding: 6px 9px; min-width: 0; }
+  .proc div { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .chart { background: var(--panel); border: 1px solid var(--line2); padding: 10px 10px 6px; }
+  .lane { display: grid; grid-template-columns: 7ch 1fr; gap: 10px; align-items: center; margin-bottom: 5px; }
+  .lane > span { color: var(--dim); font-size: 10px; letter-spacing: .14em; }
+  .track { position: relative; height: 18px; background: var(--inset); border: 1px solid var(--line); overflow: hidden; }
+  .gl { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line); }
+  .seg { position: absolute; top: 2px; bottom: 2px; background: rgba(110, 231, 135, .45); border-right: 2px solid var(--inset); color: var(--bg); font-size: 10px; line-height: 12px; padding: 0 2px; overflow: hidden; white-space: nowrap; }
+  .seg.live { background: var(--g); box-shadow: 0 0 8px rgba(110, 231, 135, .6); }
+  .seg.broke { background: repeating-linear-gradient(135deg, var(--r) 0 3px, transparent 3px 6px); }
+  .axis { position: relative; height: 14px; margin-left: calc(7ch + 10px); color: var(--dim); font-size: 10px; }
+  .axis span { position: absolute; transform: translateX(-50%); }
+
+  .log { background: var(--inset); border: 1px solid var(--line2); padding: 8px 10px; max-height: 320px; overflow: auto; }
+  .log div { white-space: pre-wrap; word-break: break-word; }
+
+  @media (max-width: 980px) {
+    .mimic { grid-template-columns: minmax(0, 1fr); }
+    .mimic > * { grid-area: auto !important; }
+    #st-dev { contain: none; }
+    #st-dev .cards { max-height: 340px; }
+    .flow.h { flex-direction: row; justify-content: center; align-self: auto; margin: 4px 0 12px; padding: 0; gap: 6px; }
+    .flow.h::after { content: ""; width: 3ch; }
+    .flow.h .n { order: -1; width: 3ch; text-align: right; }
+    .flow.h .pipe { width: 6px; height: 26px; }
+    .flow.h .pipe::after { right: auto; top: auto; left: 50%; bottom: -8px; transform: translateX(-50%); border: 0; border-left: 7px solid transparent; border-right: 7px solid transparent; border-top: 8px solid var(--c); }
+    .flow.hot.h .pipe { background: repeating-linear-gradient(180deg, var(--g) 0 8px, rgba(110, 231, 135, .16) 8px 14px); background-size: 100% 14px; animation-name: flow-y; }
+  }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; } }
+</style>
+</head>
+<body>
+<div class="top">
+  <div class="ident">
+    <div class="cmd" id="cmd" title="type a ticket number to point the buttons at it (Esc clears)">$ <span id="key">gh</span>-<input id="tk" inputmode="numeric" autocomplete="off" spellcheck="false" aria-label="ticket number"><span class="cursor"></span></div>
+    <div class="launch" id="launch">
+      <button data-kind="review"></button><button data-kind="fix"></button><button data-kind="merge"></button><button data-kind="work"></button><button data-kind="tend"></button>
+    </div>
+    <div class="modes" id="modes" title="how a start opens its chat"><span class="d">start in</span></div>
+    <div class="hint" id="hint"></div>
+  </div>
+  <div class="gauges"><div class="gauge" id="m-cpu"></div><div class="gauge" id="m-mem"></div></div>
+  <div class="status"><div id="link" class="d">&#9679; CONNECTING</div><div id="gh" class="d">greenhouse</div><div id="clock">--:--:--</div></div>
+</div>
+
+<div class="alerts" id="alerts"></div>
+
+<div class="label"><b>TICKETS</b></div>
+<div class="mimic">
+  <section class="stage" id="st-idle"><header><span class="desig">00</span><span class="name">IDLE</span><span class="count">00</span></header><div class="cards"></div></section>
+  <div class="flow h" id="f-start"><span class="n"></span><i class="pipe"></i></div>
+  <section class="stage" id="st-work"><header><span class="desig">01</span><span class="name">WORK</span><span class="count">00</span></header><div class="cards"></div></section>
+  <div class="flow h" id="f-handoff"><span class="n"></span><i class="pipe"></i></div>
+  <section class="stage" id="st-review"><header><span class="desig">02</span><span class="name">REVIEW</span><span class="count">00</span></header><div class="cards"></div></section>
+  <div class="vflows"><div class="flow v down" id="f-changes"><span class="n"></span><i class="pipe"></i></div><div class="flow v up" id="f-fixed"><span class="n"></span><i class="pipe"></i></div></div>
+  <section class="stage" id="st-fix"><header><span class="desig">02B</span><span class="name">FIX</span><span class="count">00</span></header><div class="cards"></div></section>
+  <div class="flow h" id="f-approved"><span class="n"></span><i class="pipe"></i></div>
+  <section class="stage" id="st-merge"><header><span class="desig">03</span><span class="name">MERGE</span><span class="count">00</span></header><div class="cards"></div></section>
+  <div class="flow h" id="f-landed"><span class="n"></span><i class="pipe"></i></div>
+  <section class="stage" id="st-dev"><header><span class="desig">04</span><span class="name" id="base-name">DEV</span><span class="sub">today</span><span class="count">00</span></header><div class="cards"></div></section>
+</div>
+
+<div class="label"><b>LOCKS</b></div>
+<div class="systems">
+  <section class="panel"><header><span class="desig">S1</span><span class="name">DB LOCK</span></header><div class="body" id="sys-db"></div></section>
+  <section class="panel"><header><span class="desig">S2</span><span class="name">HEAVY</span></header><div class="body" id="sys-heavy"></div></section>
+  <section class="panel"><header><span class="desig">S3</span><span class="name">LOCAL STACK</span></header><div class="body" id="sys-stack"></div></section>
+</div>
+
+<div class="label"><b>TIMELINE</b><span>6h</span></div>
+<div class="chart" id="chart"></div>
+
+<div class="label"><b>TOP</b><span>this machine only, never reported</span></div>
+<div class="procs" id="m-top"></div>
+
+<div class="label"><b>LOG</b></div>
+<div class="log" id="log"></div>
+
+<script>
+var $ = function (id) { return document.getElementById(id); };
+var ROLES = ['work', 'review', 'fix', 'merge'];
+var LOOPS = ['review', 'fix', 'merge'];
+var KEY = 'GH', key = 'gh';
+var NEEDS_TEXT = { permission: 'needs you: permission', question: 'needs you: question', idle: 'needs you: idle', startup: 'needs you: stuck at startup' };
+// One arrow per handoff. The last one is a squash commit on the integration branch, the rest are log events.
+function flowText(k) {
+  return {
+    start: 'claim ' + KEY + '-n/work: a work chat started the ticket',
+    handoff: 'unclaim ' + KEY + '-n/work: PR opened, off to review',
+    changes: 'claim ' + KEY + '-n/fix: changes requested, a fix chat took it',
+    fixed: 'unclaim ' + KEY + '-n/fix: fixes pushed, back to review',
+    approved: 'claim ' + KEY + '-n/merge: approved, a merge chat took it',
+    landed: 'squash commit on the integration branch'
+  }[k];
+}
+var FLOWS = ['start', 'handoff', 'changes', 'fixed', 'approved', 'landed'];
+
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+    return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  });
+}
+function pad2(n) { return String(n).padStart(2, '0'); }
+function ago(ms) {
+  if (ms == null || isNaN(ms)) return '-';
+  var s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return s + 's';
+  var m = Math.floor(s / 60);
+  if (m < 60) return m + 'm';
+  return Math.floor(m / 60) + 'h' + pad2(m % 60);
+}
+function hhmm(t) { var d = new Date(t); return pad2(d.getHours()) + ':' + pad2(d.getMinutes()); }
+function base(p) { return p ? p.split('/').filter(Boolean).pop() : '-'; }
+function starts(s, prefix) { return !!s && s.indexOf(prefix) === 0; }
+function lamp(cls, text) { return '<span class="lampx ' + cls + '"><i class="lamp"></i><b class="st">' + text + '</b></span>'; }
+function gb(b) { return (b / 1073741824).toFixed(1); }
+function meter(pct, hot) {
+  var h = '';
+  for (var i = 0; i < 20; i++) h += '<i' + (i < Math.round(pct / 5) ? ' class="on"' : '') + '></i>';
+  return '<div class="meter' + (hot ? ' hot' : '') + '">' + h + '</div>';
+}
+function tag(lock) { return '<span class="tag ' + (starts(lock, 'slot') ? 'g' : 'a') + '">' + esc(lock) + '</span>'; }
+
+// The lamp shows what the chat needs first, then what gh-coord can see: waiting on a lock, running
+// under one, just claimed, or quiet (r.quiet, the same rule the report uses).
+function cardState(r) {
+  if (r.chat && r.chat.needs) return ['s-need', 'NEEDS YOU'];
+  if (r.locks.some(function (l) { return starts(l, 'db-wait'); }) || starts(r.doing, 'waiting')) return ['s-wait', 'WAIT'];
+  if (r.locks.indexOf('db') >= 0 || starts(r.doing, 'db')) return ['s-run', 'DB'];
+  if (r.locks.some(function (l) { return starts(l, 'slot'); }) || starts(r.doing, 'heavy')) return ['s-run', 'HEAVY'];
+  if (r.quiet) return ['s-quiet', 'QUIET'];
+  if (r.ticket) return ['s-act', 'CLAIMED'];
+  return ['', 'IDLE'];
+}
+
+function card(r, now) {
+  var st = cardState(r), seen = r.chat ? now - r.chat.seen : null, quiet = r.quiet;
+  var needs = r.chat && r.chat.needs ? NEEDS_TEXT[r.chat.needs] : '';
+  var doing = needs || r.doing || (quiet ? 'silent ' + ago(quiet) : '');
+  var name = r.chat && r.chat.name;
+  var unclaim = quiet && !r.doing ? '<div class="card-fix" title="run this if the chat is gone">gh-coord unclaim ' + esc(r.ticket + ' ' + r.label) + '</div>' : '';
+  var last = !r.ticket && r.chat && r.chat.lastTicket ? '<span>last ' + esc(r.chat.lastTicket) + '</span>' : '';
+  var status = r.chat && r.chat.status ? '<span class="tag ' + (r.chat.status === 'busy' ? 'g' : 'd') + '">' + r.chat.status + '</span>' : '';
+  return '<div class="card ' + st[0] + '">' +
+    '<div class="card-top"><i class="lamp"></i><b class="st">' + st[1] + '</b>' +
+    '<span class="tk">' + esc(r.ticket || name || r.label || 'chat') + '</span>' +
+    '<span class="age" title="claimed this long ago">' + (r.claimed ? ago(now - r.claimed) : '') + '</span></div>' +
+    (r.ticket && name ? '<div class="card-name" title="chat name">' + esc(name) + '</div>' : '') +
+    (doing ? '<div class="card-do' + (needs ? ' a' : r.doing ? '' : ' d') + '" title="' + esc(doing) + '">' + esc(doing) + '</div>' : '') + unclaim +
+    '<div class="card-meta">' + status + r.locks.map(tag).join('') + last + '<span>' + esc(base(r.worktree)) + '</span>' +
+    '<span title="last gh-coord call from this chat">seen ' + (seen == null ? '-' : ago(seen)) + '</span></div>' +
+    '</div>';
+}
+
+function renderStages(s) {
+  var by = { idle: [], work: [], review: [], fix: [], merge: [] };
+  s.rows.forEach(function (r) { by[r.ticket && ROLES.indexOf(r.role) >= 0 ? r.role : 'idle'].push(r); });
+  Object.keys(by).forEach(function (k) {
+    var el = $('st-' + k), list = by[k];
+    el.classList.toggle('live', k !== 'idle' && list.length > 0);
+    el.querySelector('.count').textContent = pad2(list.length);
+    el.querySelector('.cards').innerHTML = list.length
+      ? list.map(function (r) { return card(r, s.now); }).join('')
+      : '<div class="empty">none</div>';
+  });
+  var merged = s.dev.merged, el = $('st-dev');
+  $('base-name').textContent = s.base;
+  el.classList.toggle('live', merged.length > 0);
+  el.querySelector('.count').textContent = pad2(merged.length);
+  var list = el.querySelector('.cards'), scroll = list.scrollTop;
+  var suffix = new RegExp(' \\[' + KEY + '-\\d+\\]$');
+  list.innerHTML = s.dev.error
+    ? '<div class="empty">' + esc(s.dev.error) + '</div>'
+    : merged.length
+      ? merged.map(function (m) {
+          return '<div class="merge" title="' + esc(m.subject) + '"><span class="d">' + hhmm(m.ts) + '</span><span class="hi">' +
+            esc(m.ticket || '-') + '</span><span class="subj">' + esc(m.subject.replace(/^\w+: /, '').replace(suffix, '')) + '</span></div>';
+        }).join('')
+      : '<div class="empty">none</div>';
+  list.scrollTop = scroll;
+}
+
+function renderFlows(s) {
+  FLOWS.forEach(function (k) {
+    var el = $('f-' + k), ev = s.flows[k] || [], last = ev.length ? ev[ev.length - 1].ts : null;
+    el.classList.toggle('lit', ev.length > 0);
+    el.classList.toggle('hot', last != null && s.now - last < 10 * 60e3);
+    el.querySelector('.n').textContent = ev.length || '';
+    el.title = flowText(k) + '\n' + (ev.length
+      ? ev.slice(-10).reverse().map(function (e) { return hhmm(e.ts) + '  ' + e.ticket; }).join('\n')
+      : 'none in the last 6h');
+  });
+}
+
+function renderAlerts(s) {
+  var busy = s.heavy.filter(function (h) { return h.held; }).length;
+  var stale = (s.db && s.db.stale) || s.heavy.some(function (h) { return h.stale; });
+  var needing = s.rows.filter(function (r) { return r.chat && r.chat.needs; }).length;
+  var tiles = [
+    ['NEEDS YOU' + (needing ? ' ' + needing : ''), needing > 0, 'a'],
+    ['DB LOCK HELD', !!s.db, 'a'],
+    ['DB-WAIT' + (s.waiting.length ? ' ' + s.waiting.length : ''), s.waiting.length > 0, 'a'],
+    ['HEAVY FULL', s.heavy.length > 0 && busy === s.heavy.length, 'a'],
+    ['STALE LOCK', !!stale, 'r'],
+    ['STACK DOWN', s.stackDown, 'r'],
+    ['MEM PRESSURE', memTight(s.machine), 'a'],
+    ['DISK LOW', diskLow(s.machine), 'r'],
+    ['MERGED' + (s.dev.merged.length ? ' ' + s.dev.merged.length : ''), s.dev.merged.length > 0, 'g']
+  ];
+  $('alerts').innerHTML = tiles.map(function (t) {
+    return '<div class="tile' + (t[1] ? ' on-' + t[2] : '') + '">' + esc(t[0]) + '</div>';
+  }).join('');
+}
+
+function memTight(m) { return m.pressure != null && m.pressure < 20; }
+function diskLow(m) { return !!m.disk && m.disk.free < 20 * 1073741824; }
+
+// Redrawn on every poll, apart from the keyed redraw below, since CPU changes every tick.
+function renderMachine(s) {
+  var m = s.machine;
+  var hist = new Array(Math.max(0, 90 - m.hist.length)).fill(null).concat(m.hist);
+  $('m-cpu').title = (m.model || '') + ', ' + m.ncpu + ' cores. Bars: each core now, then the last 3 minutes.';
+  $('m-cpu').innerHTML =
+    '<div class="row"><span class="name">CPU</span><span class="val">' + (m.pct == null ? '-' : m.pct + '%') + '</span>' +
+    '<span class="sm">load ' + m.load.map(function (l) { return l.toFixed(1); }).join(' ') + '</span></div>' +
+    '<div class="cores">' + m.cores.map(function (p) {
+      return '<i><b' + (p >= 90 ? ' class="hot"' : '') + ' style="height:' + p + '%"></b></i>';
+    }).join('') + '</div>' +
+    '<div class="spark">' + hist.map(function (p) {
+      return p == null ? '<i style="height:0"></i>' : '<i' + (p >= 90 ? ' class="hot"' : '') + ' style="height:' + Math.max(p, 4) + '%"></i>';
+    }).join('') + '</div>';
+  $('m-mem').innerHTML = !m.mem ? '<div class="row"><span class="name">MEM</span><span class="sm">reading</span></div>' :
+    '<div class="row"><span class="name">MEM</span><span class="val">' + gb(m.mem.used) + ' / ' + gb(m.mem.total) + ' GB</span>' +
+    (m.pressure != null ? '<span class="sm' + (memTight(m) ? ' a' : '') + '">pressure ' + m.pressure + '% free</span>' : '') + '</div>' +
+    meter(m.mem.used / m.mem.total * 100, memTight(m)) +
+    '<div class="row foot">' + (m.swap && m.swap.total ? '<span>swap ' + gb(m.swap.used) + ' / ' + gb(m.swap.total) + ' GB</span>' : '<span></span>') +
+    (m.disk ? '<span class="' + (diskLow(m) ? 'r' : '') + '">disk ' + gb(m.disk.free) + ' GB free</span>' : '') + '</div>';
+  $('m-top').innerHTML = m.top.map(function (p) {
+    return '<div class="proc"><div><span class="hi">' + esc(p.name) + '</span>' + (p.n > 1 ? ' <span class="d">&times;' + p.n + '</span>' : '') + '</div>' +
+      '<div><span class="' + (p.cpu >= 100 ? 'a' : '') + '">' + Math.round(p.cpu) + '%</span> <span class="d">&middot; ' + gb(p.rss) + ' GB</span></div></div>';
+  }).join('') || '<div class="d">reading</div>';
+}
+
+function dbLoad(s) {
+  var from = s.timeline.from, span = s.now - from, held = 0, longest = 0, segs = s.timeline.lanes[0].segs;
+  segs.forEach(function (g) { held += g.end - Math.max(g.start, from); longest = Math.max(longest, g.end - g.start); });
+  return { pct: Math.round(held / span * 100), holds: segs.length, longest: longest };
+}
+
+function renderLocks(s) {
+  var h = '', load = dbLoad(s);
+  if (!s.localStack) h += '<div class="line">' + lamp('', 'OFF') + '<span class="d">no local_stack in the greenhouse block</span></div>';
+  else if (s.db) {
+    h += '<div class="line">' + (s.db.stale ? lamp('s-alarm', 'STALE') : lamp('s-held', 'HELD')) +
+      '<span class="hi">' + esc(s.db.label) + '</span><span class="d">' + ago(s.now - s.db.since) + ' &middot; heartbeat ' + ago(s.now - s.db.heartbeat) + '</span></div>' +
+      '<div class="d">' + esc(s.db.purpose) + (s.db.stale ? ' <span class="r">(' + esc(s.db.stale) + ')</span>' : '') + '</div>';
+  } else h += '<div class="line">' + lamp('s-run', 'FREE') + '</div>';
+  h += '<div class="line" style="margin-top:8px"><span class="k">db-wait</span>' + (s.waiting.length ? '' : '<span class="d">none</span>') + '</div>';
+  s.waiting.forEach(function (w, i) {
+    h += '<div class="line">' + lamp('s-wait', String(i + 1)) + '<span class="hi">' + esc(w.label) + '</span><span class="d">' + ago(s.now - w.since) + ' &middot; ' + esc(w.purpose) + '</span></div>';
+  });
+  h += '<div class="line" style="margin-top:8px"><span class="k">load 6h</span><span class="hi">' + load.pct + '%</span><span class="d">' + load.holds + ' holds &middot; longest ' + ago(load.longest) + '</span></div>' +
+    meter(load.pct, load.pct >= 75);
+  $('sys-db').innerHTML = h;
+
+  $('sys-heavy').innerHTML = s.heavy.map(function (p) {
+    if (!p.held) return '<div class="line"><span class="k">slot' + p.slot + '</span>' + lamp('', 'FREE') + '</div>';
+    return '<div class="line"><span class="k">slot' + p.slot + '</span>' + (p.stale ? lamp('s-alarm', 'STALE') : lamp('s-run', 'BUSY')) +
+      '<span class="hi">' + esc(p.label) + '</span><span class="d">' + ago(s.now - p.since) + '</span></div>' +
+      '<div class="d" style="margin:0 0 6px 7ch;padding-left:10px">' + esc(p.cmd) + (p.stale ? ' <span class="r">(' + esc(p.stale) + ')</span>' : '') + '</div>';
+  }).join('');
+
+  var up = starts(s.stack, 'up');
+  var claimed = s.rows.filter(function (r) { return r.claimed; }).length;
+  $('sys-stack').innerHTML =
+    '<div class="line"><span class="k">db-stack</span>' + (!s.localStack ? lamp('', 'NONE') : up ? lamp('s-run', 'UP') : s.stackDown ? lamp('s-alarm', 'DOWN') : lamp('', '...')) + '<span class="d">' + esc(s.stack) + '</span></div>' +
+    '<div class="line"><span class="k">chats</span><span class="hi">' + claimed + '</span><span class="d">claimed</span><span class="hi">' + (s.rows.length - claimed) + '</span><span class="d">idle</span></div>' +
+    '<div class="line"><span class="k">machine</span><span class="d">' + esc(s.machineName) + '</span></div>';
+}
+
+function renderTimeline(s) {
+  var from = s.timeline.from, span = s.now - from, grid = '', axis = '';
+  for (var t = Math.ceil(from / 3600e3) * 3600e3; t < s.now; t += 3600e3) {
+    var x = (t - from) / span * 100;
+    grid += '<i class="gl" style="left:' + x + '%"></i>';
+    axis += '<span style="left:' + x + '%">' + hhmm(t) + '</span>';
+  }
+  var h = s.timeline.lanes.map(function (lane) {
+    var segs = lane.segs.map(function (g) {
+      var a = Math.max(g.start, from), left = (a - from) / span * 100, width = Math.max(0.3, (g.end - a) / span * 100);
+      var tk = String(g.label || '').split('/')[0];
+      var tip = g.label + '  ' + hhmm(g.start) + '-' + (g.live ? 'now' : hhmm(g.end)) + ' (' + ago(g.end - g.start) + ')' +
+        (g.broke ? '  broken as stale' : '') + '\n' + g.what;
+      return '<div class="seg' + (g.live ? ' live' : '') + (g.broke ? ' broke' : '') + '" style="left:' + left + '%;width:' + width + '%" title="' +
+        esc(tip) + '">' + (width >= 2 ? esc(tk.replace(KEY + '-', '')) : '') + '</div>';
+    }).join('');
+    return '<div class="lane"><span>' + esc(lane.name) + '</span><div class="track">' + grid + segs + '</div></div>';
+  }).join('');
+  $('chart').innerHTML = h + '<div class="axis">' + axis + '</div>';
+}
+
+function renderLog(s) {
+  $('log').innerHTML = s.log.map(function (l) {
+    var m = l.msg, cls = /BROKE/.test(m) ? 'r' : /ACQUIRE|^claim/.test(m) ? 'g' : /RELEASE|^unclaim/.test(m) ? 'd' : '';
+    return '<div><span class="d">' + hhmm(l.ts) + '</span> <span class="' + cls + '">' + esc(m) + '</span></div>';
+  }).join('') || '<div class="d">empty</div>';
+}
+
+function renderGreenhouse(s) {
+  var g = s.greenhouse, el = $('gh');
+  if (g.state === 'reporting') { el.className = 'g'; el.textContent = 'GREENHOUSE ' + (g.live ? 'LIVE' : 'POLLING'); }
+  else if (g.state === 'off') { el.className = 'a'; el.textContent = 'GREENHOUSE OFF'; }
+  else if (g.state === 'error') { el.className = 'r'; el.textContent = 'GREENHOUSE ERROR'; }
+  else { el.className = 'd'; el.textContent = 'GREENHOUSE ...'; }
+  el.title = g.error || (g.state === 'reporting' ? 'reports this machine\'s chats when they change (last ' + ago(s.now - g.lastSent) + ' ago); ' +
+    (g.live ? 'starts from ticket pages arrive at once' : 'checking for starts every minute (no realtime connection)') : '');
+}
+
+// The start buttons and the mode switch.
+var hintTimer;
+function hint(cls, text) {
+  $('hint').className = 'hint ' + cls;
+  $('hint').textContent = text;
+  clearTimeout(hintTimer);
+  hintTimer = setTimeout(function () { $('hint').textContent = ''; }, 30000);
+}
+function post(url, body) {
+  return fetch(url, { method: 'POST', headers: { 'content-type': 'application/json', 'x-gh-dash': '1' }, body: JSON.stringify(body) })
+    .then(function (r) { return r.json(); });
+}
+function start(kind) {
+  hint('d', 'opening a chat...');
+  post('/api/start', { kind: kind, ticket: $('tk').value.replace(/\D/g, '') })
+    .then(function (o) {
+      if (o.error) hint('r', o.error);
+      else if (o.already) hint('g', o.name + ' is already open' + (o.attach ? ': ' + o.attach : ': showing it'));
+      else if (o.enter) hint('a', 'open in VS Code: press Enter to run ' + o.run);
+      else if (o.mode === 'background') hint('g', o.name + ' is running in the background: ' + o.attach);
+      else hint('g', o.name + ' is running in a new terminal: ' + o.run);
+    })
+    .catch(function () { hint('r', 'gh-dash is not answering'); });
+}
+$('launch').addEventListener('click', function (e) {
+  var b = e.target.closest('button');
+  if (b) start(b.getAttribute('data-kind'));
+});
+var MODE_TIPS = {
+  terminal: 'a new terminal window, named, runs with no Enter, and shows in the Claude app (Remote Control)',
+  background: 'claude --bg: named, runs with no Enter, no window; claude attach <name> opens it, the Claude app shows it',
+  vscode: 'a VS Code tab with the command typed in: press Enter to run it'
+};
+var currentMode = '', modesKey = '';
+function renderModes(s) {
+  currentMode = s.mode;
+  var k = s.modes.join(',') + '|' + s.mode;
+  if (k === modesKey) return;
+  modesKey = k;
+  $('modes').innerHTML = '<span class="d">start in</span>' + s.modes.map(function (m) {
+    return '<button data-mode="' + m + '" class="' + (m === s.mode ? 'on' : '') + '" title="' + esc(MODE_TIPS[m]) + '">' + m + '</button>';
+  }).join('');
+}
+$('modes').addEventListener('click', function (e) {
+  var b = e.target.closest('button');
+  if (!b) return;
+  post('/api/mode', { mode: b.getAttribute('data-mode') })
+    .then(function (o) { if (o.error) hint('r', o.error); else { modesKey = ''; hint('d', 'starts now open in ' + o.mode + ' mode'); tick(); } });
+});
+// The buttons say what a click starts: with a number, one pass of the skill on that ticket; without
+// one, a numbered loop for review, fix and merge, and work picks the next tended ticket.
+var nextNames = {};
+function labelStarts() {
+  var n = $('tk').value.replace(/\D/g, '');
+  ['review', 'fix', 'merge', 'work', 'tend'].forEach(function (k) {
+    var b = document.querySelector('[data-kind="' + k + '"]'), loop = LOOPS.indexOf(k) >= 0;
+    b.textContent = k + ' ' + (n || (loop ? 'loop' : k === 'work' ? 'next' : ''));
+    b.disabled = k === 'tend' && !n;
+    b.title = n
+      ? 'new chat ' + key + '-' + n + (k === 'work' ? '' : ' ' + k) + ' running ' + (k === 'tend' ? '/greenhouse:tend-ticket' : '/greenhouse:loop-' + k) + ' ' + KEY + '-' + n +
+        (k === 'merge' ? '\none pass: if CI is still running, a merge loop lands it' : '')
+      : loop ? 'new chat ' + (nextNames[k] || key + '-' + k + ' n') + ' running /loop 5m /greenhouse:loop-' + k
+      : k === 'work' ? 'new chat ' + (nextNames.work || key + '-work n') + ' running /greenhouse:loop-work; it picks the next tended ticket'
+      : 'enter a ticket number to tend';
+  });
+}
+function setTicket(v) {
+  var t = $('tk');
+  t.value = v.replace(/\D/g, '').slice(0, 6);
+  t.style.width = t.value.length + 'ch';
+  labelStarts();
+}
+$('tk').addEventListener('input', function () { setTicket($('tk').value); });
+$('tk').addEventListener('keydown', function (e) { if (e.key === 'Escape') setTicket(''); });
+$('cmd').addEventListener('click', function () { $('tk').focus(); });
+labelStarts();
+function renderStarts(s) {
+  if (s.KEY !== KEY) { KEY = s.KEY; key = s.key; $('key').textContent = key; }
+  nextNames = s.starts; labelStarts();
+}
+
+var lastKey = '', lastDraw = 0;
+function render(s) {
+  renderStarts(s); renderModes(s); renderAlerts(s); renderMachine(s); renderGreenhouse(s);
+  // Redraw on change, or every 10s for the ages, so a text selection survives between polls.
+  var k = JSON.stringify([s.rows, s.db, s.waiting, s.heavy, s.stack, s.stackDown, s.dev, s.flows, s.log[0]]);
+  if (k === lastKey && Date.now() - lastDraw < 10000) return;
+  lastKey = k; lastDraw = Date.now();
+  renderStages(s); renderFlows(s); renderLocks(s); renderTimeline(s); renderLog(s);
+  var needing = s.rows.filter(function (r) { return r.chat && r.chat.needs; }).length;
+  document.title = (needing ? '(' + needing + ' need you) ' : s.waiting.length ? '(' + s.waiting.length + ' db-wait) ' : '') + 'gh-dash ' + key;
+}
+
+function tick() {
+  fetch('/api/state', { cache: 'no-store' })
+    .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
+    .then(function (s) { render(s); $('link').className = 'g'; $('link').textContent = '● CONNECTED'; })
+    .catch(function () { $('link').className = 'r'; $('link').textContent = '● DISCONNECTED'; });
+}
+function clock() { $('clock').textContent = new Date().toLocaleTimeString([], { hour12: false }); }
+tick(); clock();
+setInterval(tick, 2000);
+setInterval(clock, 1000);
+</script>
+</body>
+</html>
+`;

@@ -163,6 +163,66 @@ Every link is maintained by a skill. `open-pr`'s ticket gate stops a PR without 
 | **health-check** | Branch and worktree cleanup, integration-branch build, Greenhouse↔GitHub sync verification |
 | **release** | Generate notes from harvested tickets, open the promotion PR (`release_flow: promotion-pr`), tag, and watch what the tag fires |
 
+### Parallel Agents
+
+User-invoked only. See [Parallel agents](#parallel-agents-optional) for setup.
+
+| Skill | What it does |
+|-------|-------------|
+| **loop-work** | Claim the next tended ticket assigned to you and implement it autonomously in its own worktree |
+| **loop-fix** | Address review feedback on one of your PRs in its ticket's worktree |
+| **loop-review** | One read-only review tick: review PRs waiting on you at a head you haven't reviewed |
+| **loop-merge** | One merge tick: apply an approved PR's merge conditions, wait for every CI job, land it |
+
+---
+
+## Parallel agents (optional)
+
+Run several Claude Code chats on one project at once — some implementing tickets, some fixing review feedback, one reviewing, one merging — without them fighting over tickets, your checkout, the local database or the CPU. Each chat works in its own git worktree, and the shared things go through **`gh-coord`**, a small coordinator in the plugin's `bin/`. **`gh-dash`** is the local dashboard that shows every chat and starts new ones, and it's the one process that tells Greenhouse what this machine is running: the team sees it on the **Agents** page, on each ticket, and as an orange badge on the corkboard. Nothing runs in the cloud — the chats run on your machine.
+
+### Set up once per project
+
+Add the keys your project needs to the `greenhouse` block in CLAUDE.md (only `project_key` is required, and it's already there):
+
+```greenhouse
+local_stack: myapp                      # the project_id in supabase/config.toml; leave out when there's no local database
+db_commands: [pnpm db:seed, pnpm test:db, "supabase *"]   # need the DB lock
+heavy_commands: [pnpm build, pnpm typecheck]               # take a heavy slot
+```
+
+Without `local_stack` the DB lock turns off and the chats skip it.
+
+### Set up once per machine
+
+1. **Trust the repo for the CLI and approve its MCP servers.** Run `claude` once in a terminal in the main checkout and accept the prompts. A chat started without anyone watching otherwise stops at that dialog (gh-dash flags it as *stuck at startup*).
+2. **Phone access to your chats (recommended).** Turn on **Enable Remote Control for all sessions** (VS Code: the command menu's Settings; CLI: `/config`, or `"remoteControlAtStartup": true` in `~/.claude/settings.json`) and **Push when actions required** in `/config`, then sign in to the Claude app. Every chat then shows in the app's Code tab, and permission prompts and questions buzz your phone and can be answered there. On a Team plan an org Owner first enables Remote Control in claude.ai's Claude Code admin settings. Greenhouse never carries your chats' questions or answers — Remote Control does.
+3. **Optional env vars:** `GREENHOUSE_HEAVY_SLOTS` (default 1; 2 on a big machine), `GREENHOUSE_MACHINE` (default: the hostname), `GREENHOUSE_DASH_PORT` (default 7777, the next free port when taken), `GREENHOUSE_TERMINAL=iterm` (default: Terminal), `GREENHOUSE_AGENTS_DIR` (default `~/.greenhouse/agents/<project_key>`), `GREENHOUSE_PLUGIN_DIR` (a plugin checkout that terminal and background starts load with `--plugin-dir` — for trying plugin changes before a release; VS Code starts can't pass it).
+
+### Start the dashboard
+
+From any Claude Code chat in the repo, type `! gh-dash --detach --open` (the plugin's `bin/` is on the chat's PATH). It keeps running after the chat closes, and every loop skill starts it if it isn't running. It serves `http://127.0.0.1:7777` on this machine only.
+
+**While gh-dash runs, Greenhouse can see this machine.** It reports only when something changes (there's no heartbeat), so a quiet machine costs nothing. Stop it and its chats end at once; if the machine sleeps or crashes, it shows offline after 10 minutes. A chat closed while it still holds a ticket ends an hour after its last `gh-coord` call (the dashboard offers the `gh-coord unclaim` line). Ticket status is unaffected either way, because the skills write that themselves. `gh-dash --report-preview` prints exactly what it sends: per chat its session id, name, ticket, role, what it's doing, needs-you, folder name and start time; per machine its heavy slots (how many, who holds each and what it runs), the DB lock and who's waiting, the stack and its start mode. Never transcript or prompt text, file contents, env values, CPU or memory, process lists or full paths. CPU, memory and busy/idle stay on the local page.
+
+### Starting chats
+
+Type a ticket number into the dashboard's `$ <key>-` prompt and click a button, or leave it empty to start a numbered `/loop 5m` review, fix or merge chat (`work next` picks the next tended ticket). A ticket's chat that's already open comes to the front instead of starting a second. Names never repeat within a day: loops count up (`<key>-review 1`, `2`, …), and a ticket's second chat of a kind gets a number (`<key>-<n> 2`, `<key>-<n> fix 2`), even when Claude Code shows no sign of the first. The **start in** switch picks how the chat opens:
+
+| Mode | What you get |
+|------|--------------|
+| **terminal** (default on macOS) | A Terminal (or iTerm) window running `claude -n <name> --remote-control <name> "<command>"`: named, runs with no Enter, and shows in the Claude app |
+| **background** | `claude --bg`: named, runs with no Enter, no window. `claude attach <name>` opens it |
+| **vscode** | A VS Code tab with the command typed in. Press Enter once — the extension's link can't send it |
+
+From Greenhouse, a ticket's start buttons (tend, work, review, fix, merge, right under its title on the corkboard pane and the kanban modal) queue a request that reaches your gh-dash at once. They show only while one of your machines is online. The request travels over Supabase Realtime, on a private topic only you can join, and starts in terminal (or background) mode. Without a Realtime connection gh-dash checks the queue every minute instead. Requests carry only a kind and a ticket — never free text — and expire after 10 minutes. **Open in VS Code** opens the command in VS Code on whichever machine you clicked it.
+
+### Known limits
+
+- gh-dash reads Claude Code internals that aren't a documented interface (`~/.claude/sessions`, transcript titles). After a Claude Code update it may show chats unnamed; it degrades rather than breaks.
+- A queued start needs the machine awake and gh-dash running. Terminal mode is macOS only; elsewhere use background.
+- Each running gh-dash holds one Supabase Realtime connection, which counts toward the plan's concurrent-connection limit.
+- The DB lock is per project. Two projects that share local database ports are guarded only by `db-stack` reporting `other:<project>`.
+
 ---
 
 ## Epic Branch Workflow
@@ -265,7 +325,11 @@ plugin/
 │   ├── setup/SKILL.md
 │   ├── dashboard/SKILL.md
 │   ├── health-check/SKILL.md
-│   └── release/SKILL.md
+│   ├── release/SKILL.md
+│   └── loop-{work,fix,review,merge}/SKILL.md  # Parallel agents (optional)
+├── bin/                         # gh-jwt, gh-heartbeat, gh-coord, gh-dash
+├── hooks/hooks.json             # Notification hook: marks a parallel-agent chat as needing you
+├── tests/gh-coord.test.sh       # Coordinator smoke tests (run in CI)
 ├── references/                  # Tech stack, schemas, gates, conventions
 ├── templates/                   # PR, ticket, plan, release note templates
 ├── LICENSE                      # MIT

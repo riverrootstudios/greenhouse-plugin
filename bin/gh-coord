@@ -1,0 +1,419 @@
+#!/usr/bin/env bash
+# gh-coord — one-machine coordination for parallel Claude Code chats on a Greenhouse project (GH-129).
+#
+# Shared things it guards, machine-wide across every checkout of the repo:
+#   - ticket claims, so two chats never pick up the same ticket
+#   - the local database stack (one set of ports; every reset replaces the schema for everyone)
+#   - heavy slots, so parallel chats don't stack full-machine builds and run out of memory
+#
+# Run it from inside the repo or any of its worktrees; the main checkout comes from git
+# (override with GREENHOUSE_MAIN_REPO). Locks are mkdir-atomic directories under the state folder.
+#
+# Per project, from the repo's CLAUDE.md `greenhouse` block:
+#   project_key       ticket prefix and chat names (required)
+#   integration_branch  base branch (default: dev when origin/dev exists, else main)
+#   local_stack       the local Supabase stack's project_id; absent turns the DB lock off
+#   db_commands       commands that need the DB lock (listed for chats, not enforced)
+#   heavy_commands    commands that take a heavy slot (listed for chats, not enforced)
+# Per machine, from env vars:
+#   GREENHOUSE_AGENTS_DIR (~/.greenhouse/agents/<project_key>), GREENHOUSE_HEAVY_SLOTS (1),
+#   GREENHOUSE_LOCK_STALE_MIN (30), GREENHOUSE_MACHINE (hostname)
+#
+# Chats: inside a Claude Code chat ($CLAUDE_CODE_SESSION_ID set), every call records the chat in
+# <state>/chats/<session id>. claim sets its ticket and role, unclaim clears the ticket, and
+# db-wait, db-run and heavy-run set what it's doing. Callers do nothing extra; gh-dash reads it.
+#
+#   gh-coord status
+#   gh-coord config                                       KEY=value lines (gh-dash reads these)
+#   gh-coord paths           <TICKET>                     prints MAIN= WT= (eval it)
+#   gh-coord greenhouse-env                               Greenhouse auth + project exports (eval it)
+#   gh-coord worktree-setup  <worktree>                   copy gitignored .env* files from the main checkout
+#   gh-coord db-stack                                     up | down | other:<project> | none (exit 0 | 1 | 2 | 0)
+#   gh-coord db-acquire      <label> <worktree> <purpose> exit 0 acquired (or already mine), 1 held
+#   gh-coord db-wait         <label> <worktree> <purpose> blocks until acquired (run in background)
+#   gh-coord db-run          <label> -- <cmd...>          run cmd while holding, heartbeat kept fresh
+#   gh-coord db-heartbeat    <label>
+#   gh-coord db-release      <label>
+#   gh-coord heavy-run       <label> -- <cmd...>          run cmd in one of the heavy slots; waits for a free one
+#   gh-coord claim           <ticket> <label> <worktree>  exit 0 claimed (or already mine), 1 taken
+#   gh-coord unclaim         <ticket> <label>
+#   gh-coord migration-floor                              highest migration version across origin/<base> + every worktree
+#   gh-coord needs-you       [<notification type>]        from the plugin's Notification hook (JSON on stdin)
+#   gh-coord seen                                         from the plugin's PostToolUse/UserPromptSubmit hooks: the chat is
+#                                                         going (clears gh-dash's starting marker) and not waiting (clears needs-you)
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$0")" && pwd)"
+CHAT="${CLAUDE_CODE_SESSION_ID:-}"
+# Processes that could be using the local database when a lock looks stale.
+DB_PROCS='vitest|jest|supabase|tsx|psql|turbo|pytest|prisma'
+
+die() { echo "gh-coord: $*" >&2; exit 65; }
+now() { date +%s; }
+stamp() { date '+%Y-%m-%d %H:%M:%S'; }
+if stat -c %Y / >/dev/null 2>&1; then mtime() { stat -c %Y "$1" 2>/dev/null; }; else mtime() { stat -f %m "$1" 2>/dev/null; }; fi
+age_min() { local m; m=$(mtime "$1") || m=$(now); echo $(( ($(now) - ${m:-$(now)}) / 60 )); }
+field() { sed -n "s/^$2=//p" "$1/owner" 2>/dev/null; }
+kv() { sed -n "s/^$2=//p" "$1" 2>/dev/null; }
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# `doing` text is shown to the team in Greenhouse: drop NAME=value pairs (env values) and cap it.
+sanitize() {
+  printf '%s' "$*" | tr '\n' ' ' | sed -E 's/(^|[[:space:]])[A-Za-z_][A-Za-z0-9_]*=[^[:space:]]*//g; s/^[[:space:]]+//' | cut -c1-120
+}
+
+# A string field from a one-line JSON object (hook input). Good enough for ids and paths.
+json_str() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1; }
+
+main_repo() {
+  if [ -n "${GREENHOUSE_MAIN_REPO:-}" ]; then echo "$GREENHOUSE_MAIN_REPO"; return 0; fi
+  local common; common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  dirname "$common"
+}
+
+# One key from the greenhouse block in the main checkout's CLAUDE.md.
+fence() {
+  sed -n '/^```greenhouse[[:space:]]*$/,/^```[[:space:]]*$/p' "$MAIN/CLAUDE.md" 2>/dev/null \
+    | sed -n "s/^$1:[[:space:]]*//p" | head -1 | sed -E 's/[[:space:]]+#.*$//; s/[[:space:]]*$//'
+}
+
+# `[a, "b c", d]` or `a, b` -> `a; b c; d`
+list_of() { printf '%s' "$1" | sed -E 's/^\[//; s/\]$//' | tr ',' '\n' | sed -E 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^"(.*)"$/\1/' | grep . | paste -sd ';' - | sed 's/;/; /g'; }
+
+load_config() {
+  MAIN=$(main_repo) || return 1
+  KEY=$(fence project_key | tr '[:lower:]' '[:upper:]')
+  [ -n "$KEY" ] || return 2
+  PROJECT_ID=$(fence project_id)
+  BASE=$(fence integration_branch)
+  if [ -z "$BASE" ]; then
+    if git -C "$MAIN" rev-parse -q --verify refs/remotes/origin/dev >/dev/null 2>&1; then BASE=dev; else BASE=main; fi
+  fi
+  LOCAL_STACK=$(fence local_stack)
+  DB_COMMANDS=$(list_of "$(fence db_commands)")
+  HEAVY_COMMANDS=$(list_of "$(fence heavy_commands)")
+  STATE="${GREENHOUSE_AGENTS_DIR:-$HOME/.greenhouse/agents/$(lower "$KEY")}"
+  STALE_MIN="${GREENHOUSE_LOCK_STALE_MIN:-30}"
+  HEAVY_SLOTS="${GREENHOUSE_HEAVY_SLOTS:-1}"
+  MACHINE="${GREENHOUSE_MACHINE:-$(hostname -s 2>/dev/null || hostname)}"
+  DB_LOCK="$STATE/db.lock"
+  WAITING="$STATE/db.waiting"
+  CLAIMS="$STATE/claims"
+  HEAVY="$STATE/heavy"
+  CHATS="$STATE/chats"
+  LOG="$STATE/log"
+}
+
+log() { echo "$(stamp) $*" >>"$LOG"; }
+
+# The chat's name as Claude Code shows it (custom title, else agent name, else the generated title)
+# and its transcript, read from the last lines of the transcript. Empty when it isn't found.
+CHAT_NAME=""; CHAT_TRANSCRIPT=""
+chat_lookup() {
+  local t k v
+  CHAT_TRANSCRIPT=$(ls "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/"$CHAT".jsonl 2>/dev/null | head -1)
+  CHAT_NAME=""
+  [ -n "$CHAT_TRANSCRIPT" ] || return 0
+  t=$(tail -c 262144 "$CHAT_TRANSCRIPT" | grep -oE '"(customTitle|agentName|aiTitle)":"[^"]*"')
+  for k in customTitle agentName aiTitle; do
+    v=$(printf '%s\n' "$t" | sed -n "s/^\"$k\":\"\(.*\)\"$/\1/p" | tail -1)
+    [ -n "$v" ] && { CHAT_NAME="$v"; return 0; }
+  done
+}
+
+# Rewrites this chat's record with path=, name=, transcript= and any key=value given (an empty value
+# drops the key). Keys it doesn't know (gh-dash's started_by=) survive. The file's mtime is the
+# chat's last-seen time. Records unseen for a day are pruned.
+chat_set() {
+  [ -n "$CHAT" ] || return 0
+  local f="$CHATS/$CHAT" tmp="$CHATS/.tmp.$CHAT.$$" pair
+  local found=("path=$(pwd)")
+  chat_lookup
+  # A lookup that finds nothing keeps what the record already has (gh-dash names chats it starts).
+  [ -n "$CHAT_NAME" ] && found+=("name=$CHAT_NAME")
+  [ -n "$CHAT_TRANSCRIPT" ] && found+=("transcript=$CHAT_TRANSCRIPT")
+  { [ -f "$f" ] && cat "$f" || echo "since=$(stamp)"; } >"$tmp"
+  for pair in "${found[@]}" "$@"; do
+    pair=$(printf '%s' "$pair" | tr '\n' ' ')
+    grep -v "^${pair%%=*}=" "$tmp" >"$tmp.x"; mv "$tmp.x" "$tmp"
+    [ -n "${pair#*=}" ] && echo "$pair" >>"$tmp"
+  done
+  mv "$tmp" "$f"
+  find "$CHATS" -type f -mmin +1440 -delete 2>/dev/null
+}
+
+# needs-you runs from a Claude Code hook in every session of every plugin user, so it never creates
+# state and does nothing for a chat the coordinator doesn't already know.
+needs_you() {
+  local type="${1:-}" input="" sid tp cwd
+  [ -t 0 ] || input=$(head -c 65536)
+  sid=$(json_str "$input" session_id); tp=$(json_str "$input" transcript_path); cwd=$(json_str "$input" cwd)
+  [ -n "$type" ] || type=$(json_str "$input" notification_type)
+  sid="${sid:-$CHAT}"
+  [ -n "$sid" ] && [ -n "$type" ] || return 0
+  [ -n "$cwd" ] && [ -d "$cwd" ] && cd "$cwd"
+  load_config 2>/dev/null || return 0
+  [ -f "$CHATS/$sid" ] || return 0
+  CHAT="$sid"
+  chat_set "needs=$type" "needs_at=$(now)" ${tp:+"transcript=$tp"}
+  # The marker `seen` looks for: the record to clear once the chat moves again.
+  mkdir -p -m 700 "$MARKERS/needs" && printf '%s' "$CHATS/$sid" >"$MARKERS/needs/$sid"
+  return 0
+}
+
+# seen runs from hooks on every tool call and prompt in every session of every plugin user, so its
+# fast path is two file tests: only a chat gh-dash just started (starting/) or needs-you marked
+# (needs/) has a marker. A starting marker means the chat got past its startup dialogs; a needs
+# marker means it's no longer waiting. Claude Code builds that write no transcript can't tell
+# gh-dash either of those any other way.
+seen() {
+  local sid="${CLAUDE_CODE_SESSION_ID:-}" kind m rec
+  [ -n "$sid" ] || { [ -t 0 ] || sid=$(json_str "$(head -c 65536)" session_id); }
+  [ -n "$sid" ] || return 0
+  for kind in starting needs; do
+    m="$MARKERS/$kind/$sid"
+    [ -f "$m" ] || continue
+    rec=$(cat "$m"); rm -f "$m"
+    [ -f "$rec" ] || continue
+    if [ "$kind" = needs ]; then
+      grep -v -e '^needs=' -e '^needs_at=' "$rec" >"$rec.tmp.$$" && mv "$rec.tmp.$$" "$rec"
+    else
+      grep -q '^path=' "$rec" || printf 'path=%s\n' "$PWD" >>"$rec"
+    fi
+  done
+}
+
+# Markers live outside the state folder so a hook can find them without reading any config.
+MARKERS="${GREENHOUSE_MARKERS_DIR:-/tmp/greenhouse-agents-${UID:-$(id -u)}}"
+if [ "${1:-}" = seen ]; then seen; exit 0; fi
+if [ "${1:-}" = needs-you ]; then shift; needs_you "$@"; exit 0; fi
+
+load_config; rc=$?
+[ $rc -eq 1 ] && die "run inside the repo or a worktree, or set GREENHOUSE_MAIN_REPO"
+[ $rc -eq 2 ] && die "no project_key in the greenhouse block of $MAIN/CLAUDE.md"
+mkdir -p "$STATE" "$WAITING" "$CLAIMS" "$HEAVY" "$CHATS"
+
+# A process whose cwd is inside $1 that could be using the DB.
+busy_in() {
+  local path="$1" pid cwd
+  [ -n "$path" ] || return 1
+  for pid in $(pgrep -f "$DB_PROCS" 2>/dev/null); do
+    cwd=$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')
+    case "$cwd" in "$path"|"$path"/*) return 0 ;; esac
+  done
+  return 1
+}
+
+# Stale = holder's worktree is gone, or no heartbeat for STALE_MIN and nothing running in it.
+db_stale() {
+  local path; path=$(field "$DB_LOCK" path)
+  [ -d "$DB_LOCK" ] || return 1
+  [ -n "$path" ] && [ ! -d "$path" ] && return 0
+  [ "$(age_min "$DB_LOCK/owner")" -ge "$STALE_MIN" ] && ! busy_in "$path"
+}
+
+db_holder() {
+  echo "$(field "$DB_LOCK" label) | $(field "$DB_LOCK" purpose) | $(field "$DB_LOCK" path) | since $(field "$DB_LOCK" since) | heartbeat $(age_min "$DB_LOCK/owner")m ago"
+}
+
+try_acquire() {
+  local label="$1" path="$2" purpose="$3"
+  if [ -d "$DB_LOCK" ] && [ "$(field "$DB_LOCK" label)" = "$label" ]; then
+    touch "$DB_LOCK/owner"; echo "ACQUIRED (already held by $label)"; return 0
+  fi
+  if [ -d "$DB_LOCK" ] && db_stale; then
+    log "db BROKE stale lock: $(db_holder)"
+    echo "Broke stale lock: $(db_holder)" >&2
+    mv "$DB_LOCK" "$STATE/broken-db.lock.$(now)" 2>/dev/null
+  fi
+  if mkdir "$DB_LOCK" 2>/dev/null; then
+    printf 'label=%s\npath=%s\npurpose=%s\nsince=%s\n' "$label" "$path" "$purpose" "$(stamp)" >"$DB_LOCK/owner"
+    rm -f "$WAITING/${label//\//_}"
+    log "db ACQUIRE $label ($purpose) $path"
+    echo "ACQUIRED"; return 0
+  fi
+  echo "HELD: $(db_holder)"; return 1
+}
+
+# A heavy slot is stale when its runner process is gone, or it has had no heartbeat for
+# STALE_MIN with nothing running in its worktree (same rule as the DB lock).
+heavy_stale() {
+  local slot="$1" pid path
+  [ -d "$slot" ] || return 1
+  pid=$(field "$slot" pid); path=$(field "$slot" path)
+  [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && return 0
+  [ "$(age_min "$slot/owner")" -ge "$STALE_MIN" ] && ! busy_in "$path"
+}
+
+heavy_holder() {
+  echo "$(field "$1" label) | $(field "$1" cmd) | $(field "$1" path) | since $(field "$1" since) | heartbeat $(age_min "$1/owner")m ago"
+}
+
+# Prints the slot directory taken, or fails when every slot is busy.
+heavy_try() {
+  local label="$1" path="$2" what="$3" pid="$4" i slot
+  for i in $(seq 1 "$HEAVY_SLOTS"); do
+    slot="$HEAVY/slot$i"
+    if [ -d "$slot" ] && heavy_stale "$slot"; then
+      log "heavy BROKE stale slot$i: $(heavy_holder "$slot")"
+      mv "$slot" "$STATE/broken-heavy-slot$i.$(now)" 2>/dev/null
+    fi
+    if mkdir "$slot" 2>/dev/null; then
+      printf 'label=%s\npath=%s\ncmd=%s\npid=%s\nsince=%s\n' "$label" "$path" "$what" "$pid" "$(stamp)" >"$slot/owner"
+      log "heavy ACQUIRE slot$i $label ($what) $path"
+      echo "$slot"; return 0
+    fi
+  done
+  return 1
+}
+
+cmd="${1:-status}"; shift || true
+# Any call from a chat means it's working again, so whatever it was waiting on is answered.
+chat_set "needs=" "needs_at="
+case "$cmd" in
+  status)
+    echo "== Project $KEY ($MAIN, base $BASE, state $STATE)"
+    echo "== DB lock"
+    if [ -z "$LOCAL_STACK" ]; then echo "off (no local_stack in the greenhouse block)"
+    elif [ -d "$DB_LOCK" ]; then
+      echo "held: $(db_holder)"; db_stale && echo "  (STALE: next acquire will break it)"
+    else echo "free"; fi
+    echo "== Waiting for the DB"
+    ls "$WAITING" 2>/dev/null | while read -r w; do echo "$w: $(cat "$WAITING/$w")"; done
+    echo "== Heavy slots ($HEAVY_SLOTS)"
+    for s in "$HEAVY"/slot*; do [ -d "$s" ] && echo "$(basename "$s"): $(heavy_holder "$s")"; done
+    echo "== Ticket claims"
+    for c in "$CLAIMS"/*; do [ -d "$c" ] && echo "$(basename "$c"): $(field "$c" label) | $(field "$c" path) | since $(field "$c" since)"; done
+    echo "== Chats"
+    for f in "$CHATS"/*; do [ -f "$f" ] && echo "$(basename "$f" | cut -c1-8): $(kv "$f" ticket | grep . || echo -) $(kv "$f" role) | $(kv "$f" doing) | $(kv "$f" path) | seen $(age_min "$f")m ago"; done
+    echo "== Local stack"
+    "$0" db-stack
+    echo "== Worktrees"
+    git -C "$MAIN" worktree list 2>/dev/null
+    ;;
+  config)
+    printf 'KEY=%s\nPROJECT_ID=%s\nMAIN=%s\nBASE=%s\nSTATE=%s\nLOCAL_STACK=%s\nDB_COMMANDS=%s\nHEAVY_COMMANDS=%s\nHEAVY_SLOTS=%s\nSTALE_MIN=%s\nMACHINE=%s\n' \
+      "$KEY" "$PROJECT_ID" "$MAIN" "$BASE" "$STATE" "$LOCAL_STACK" "$DB_COMMANDS" "$HEAVY_COMMANDS" "$HEAVY_SLOTS" "$STALE_MIN" "$MACHINE"
+    ;;
+  paths)
+    [ $# -ge 1 ] || { echo "usage: paths <TICKET>" >&2; exit 64; }
+    n=$(lower "${1##*-}")
+    echo "MAIN=$MAIN"
+    echo "WT=$(dirname "$MAIN")/$(basename "$MAIN")-$n"
+    ;;
+  greenhouse-env)
+    "$BIN/gh-jwt" || exit 1
+    echo "export GREENHOUSE_PROJECT_ID='$PROJECT_ID'"
+    echo "export GREENHOUSE_PROJECT_KEY='$KEY'"
+    ;;
+  worktree-setup)
+    [ $# -ge 1 ] && [ -d "$1" ] || { echo "usage: worktree-setup <worktree>" >&2; exit 64; }
+    git -C "$MAIN" ls-files -o -i --exclude-standard --directory \
+      | grep -E '(^|/)\.env[^/]*$' | grep -vE '\.(bak|example)|\.bak-' \
+      | while read -r f; do
+          if [ -f "$1/$f" ]; then echo "kept   $f"
+          else mkdir -p "$1/$(dirname "$f")" && cp "$MAIN/$f" "$1/$f" && echo "copied $f"; fi
+        done
+    ;;
+  db-stack)
+    [ -n "$LOCAL_STACK" ] || { echo "none"; exit 0; }
+    running=$(docker ps --format '{{.Names}}' 2>/dev/null | sed -n 's/^supabase_db_//p')
+    if [ -z "$running" ]; then echo "down"; exit 1
+    elif echo "$running" | grep -qx "$LOCAL_STACK"; then echo "up ($LOCAL_STACK)"; exit 0
+    else echo "other:$(echo "$running" | tr '\n' ' ')"; exit 2; fi
+    ;;
+  db-acquire)
+    [ $# -ge 3 ] || { echo "usage: db-acquire <label> <worktree> <purpose>" >&2; exit 64; }
+    [ -n "$LOCAL_STACK" ] || { echo "ACQUIRED (DB lock off for this project)"; exit 0; }
+    try_acquire "$1" "$2" "$3"
+    ;;
+  db-wait)
+    [ $# -ge 3 ] || { echo "usage: db-wait <label> <worktree> <purpose>" >&2; exit 64; }
+    [ -n "$LOCAL_STACK" ] || { echo "ACQUIRED (DB lock off for this project)"; exit 0; }
+    echo "$3 (queued $(stamp), $2)" >"$WAITING/${1//\//_}"
+    chat_set "doing=$(sanitize "waiting for the DB: $3")"
+    deadline=$(( $(now) + ${GREENHOUSE_DB_WAIT_MAX_MIN:-240} * 60 ))
+    until try_acquire "$1" "$2" "$3" >/dev/null; do
+      [ "$(now)" -ge "$deadline" ] && { rm -f "$WAITING/${1//\//_}"; chat_set "doing="; echo "TIMEOUT waiting: $(db_holder)"; exit 2; }
+      sleep 20
+    done
+    chat_set "doing="
+    echo "ACQUIRED for $1 at $(stamp)"
+    ;;
+  db-run)
+    label="${1:-}"; shift || true; [ "${1:-}" = "--" ] && shift
+    [ $# -ge 1 ] || { echo "usage: db-run <label> -- <cmd...>" >&2; exit 64; }
+    if [ -z "$LOCAL_STACK" ]; then
+      chat_set "doing=$(sanitize "db: $*")"
+      "$@"; rc=$?
+      chat_set "doing="
+      exit $rc
+    fi
+    [ "$(field "$DB_LOCK" label)" = "$label" ] || { echo "NOT HOLDER: acquire first. $( [ -d "$DB_LOCK" ] && db_holder )" >&2; exit 3; }
+    # Detached from stdout/stderr: its sleep would otherwise hold the caller's pipe open for a minute.
+    ( while [ -d "$DB_LOCK" ]; do touch "$DB_LOCK/owner" 2>/dev/null; sleep 60; done ) >/dev/null 2>&1 &
+    hb=$!; disown "$hb" 2>/dev/null
+    chat_set "doing=$(sanitize "db: $*")"
+    "$@"; rc=$?
+    chat_set "doing="
+    kill "$hb" 2>/dev/null
+    touch "$DB_LOCK/owner" 2>/dev/null
+    exit $rc
+    ;;
+  db-heartbeat)
+    [ -n "$LOCAL_STACK" ] || { echo ok; exit 0; }
+    [ "$(field "$DB_LOCK" label)" = "${1:-}" ] && touch "$DB_LOCK/owner" && echo ok || { echo "NOT HOLDER" >&2; exit 3; }
+    ;;
+  db-release)
+    [ -n "$LOCAL_STACK" ] || { echo "RELEASED (DB lock off for this project)"; exit 0; }
+    if [ "$(field "$DB_LOCK" label)" = "${1:-}" ]; then
+      rm -rf "$DB_LOCK"; log "db RELEASE $1"; echo "RELEASED"
+    else echo "NOT HOLDER (holder: $( [ -d "$DB_LOCK" ] && db_holder || echo none ))" >&2; exit 3; fi
+    ;;
+  heavy-run)
+    [ $# -ge 2 ] || { echo "usage: heavy-run <label> -- <cmd...>" >&2; exit 64; }
+    label="$1"; shift; [ "${1:-}" = "--" ] && shift
+    [ $# -ge 1 ] || { echo "usage: heavy-run <label> -- <cmd...>" >&2; exit 64; }
+    path=$(pwd); what=$(sanitize "$*"); waited=0
+    until slot=$(heavy_try "$label" "$path" "$what" "$$"); do
+      [ "$waited" = 0 ] && echo "heavy-run: all $HEAVY_SLOTS slots busy, waiting ($(stamp))" >&2 && waited=1 \
+        && chat_set "doing=$(sanitize "waiting for a heavy slot: $what")"
+      sleep 5
+    done
+    [ "$waited" = 1 ] && echo "heavy-run: got $(basename "$slot") ($(stamp))" >&2
+    chat_set "doing=$(sanitize "heavy: $what")"
+    trap 'rm -rf "$slot"; log "heavy RELEASE $(basename "$slot") $label"; chat_set "doing="' EXIT
+    trap 'exit 130' INT TERM
+    ( while [ -d "$slot" ]; do touch "$slot/owner" 2>/dev/null; sleep 60; done ) >/dev/null 2>&1 &
+    hb=$!; disown "$hb" 2>/dev/null
+    "$@"; rc=$?
+    kill "$hb" 2>/dev/null
+    exit $rc
+    ;;
+  claim)
+    [ $# -ge 3 ] || { echo "usage: claim <ticket> <label> <worktree>" >&2; exit 64; }
+    c="$CLAIMS/$1"
+    if [ -d "$c" ] && [ "$(field "$c" label)" = "$2" ]; then
+      chat_set "ticket=$1" "role=${2##*/}" "label=$2"; echo "CLAIMED (already mine)"; exit 0
+    fi
+    if mkdir "$c" 2>/dev/null; then
+      printf 'label=%s\npath=%s\nsince=%s\nchat=%s\n' "$2" "$3" "$(stamp)" "$CHAT" >"$c/owner"; log "claim $1 by $2"
+      chat_set "ticket=$1" "role=${2##*/}" "label=$2"; echo "CLAIMED"
+    else echo "TAKEN: $(field "$c" label) | $(field "$c" path) | since $(field "$c" since)"; exit 1; fi
+    ;;
+  unclaim)
+    [ $# -ge 2 ] || { echo "usage: unclaim <ticket> <label>" >&2; exit 64; }
+    c="$CLAIMS/$1"
+    if [ "$(field "$c" label)" = "$2" ]; then
+      rm -rf "$c"; log "unclaim $1 by $2"; chat_set "ticket=" "label=" "doing=" "last_ticket=$1"; echo "UNCLAIMED"
+    else echo "NOT CLAIMANT" >&2; exit 3; fi
+    ;;
+  migration-floor)
+    [ -d "$MAIN/supabase/migrations" ] || exit 0
+    git -C "$MAIN" fetch -q origin "$BASE" 2>/dev/null
+    { git -C "$MAIN" ls-tree --name-only "origin/$BASE" supabase/migrations/ 2>/dev/null | xargs -n1 basename 2>/dev/null
+      git -C "$MAIN" worktree list --porcelain | sed -n 's/^worktree //p' | while read -r wt; do ls "$wt/supabase/migrations" 2>/dev/null; done
+    } | grep -E '^[0-9]{14}' | sort -u | tail -1
+    ;;
+  *) sed -n '2,43p' "$0"; exit 64 ;;
+esac

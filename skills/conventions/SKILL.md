@@ -55,6 +55,9 @@ Optional keys in the `greenhouse` fence — absent means the default:
 | `integration_branch` | a branch name | `dev` if `origin/dev` exists, else `main` | [Resolve Base Branch](../../references/common-operations.md#resolve-base-branch) |
 | `release_flow` | `tag-only` \| `promotion-pr` | `tag-only` | [release](../release/SKILL.md) |
 | `release_artifacts` | list, e.g. `[plugin-manifest]` | none | [release](../release/SKILL.md) Step 5.5 |
+| `local_stack` | the local Supabase stack's `project_id` | none: the DB lock is off | [parallel agents](../../references/parallel-agents.md) (`gh-coord`) |
+| `db_commands` | list of commands that need the DB lock | none | [parallel agents](../../references/parallel-agents.md) |
+| `heavy_commands` | list of commands that take a heavy slot | none | [parallel agents](../../references/parallel-agents.md) |
 
 ### Current user resolution
 
