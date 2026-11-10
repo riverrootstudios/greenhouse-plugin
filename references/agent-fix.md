@@ -1,22 +1,19 @@
----
-description: Address review feedback on one of my PRs in that ticket's git worktree, alongside other chats on this machine, through gh-coord. User-invoked only — run it when the user types /greenhouse:loop-fix, gh-dash starts it, or a /loop tick fires it, never on a general request to fix review feedback (use /greenhouse:fix-review-feedback for that).
-argument-hint: "[KEY-n] [hold]"
----
+# Agent mode: fix-review-feedback --agent
 
-# Loop: fix review feedback in a worktree
+Loaded by `/greenhouse:fix-review-feedback --agent`. Binding for the whole chat.
 
-Arguments: `$ARGUMENTS` (`hold` = push the fixes but don't re-request review: the user walks it first)
+Arguments: the skill's arguments, minus `--agent`: an optional ticket (`KEY-n`; none = my oldest `changes_requested` ticket) and an optional `hold` (push the fixes but don't re-request review: the user walks it first).
 
-You are one of several chats working this project in parallel on this machine. Read [references/parallel-agents.md](../../references/parallel-agents.md) now: it's binding for this whole chat and wins wherever another skill says otherwise. `GC` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord`. "The user" is whoever launched this chat.
+You are one of several chats working this project in parallel on this machine. Read [references/parallel-agents.md](parallel-agents.md) now: it's binding for this whole chat and wins wherever another skill says otherwise. `GC` and `DASH` are the gh-coord and gh-dash paths the skill's agent-mode section gave. "The user" is whoever launched this chat.
 
 ## 1. Pick the PR (with the user still at the keyboard)
 
-1. `${CLAUDE_PLUGIN_ROOT}/bin/gh-dash --detach`, then `eval "$(GC greenhouse-env)"`: `ME=$GREENHOUSE_TEAM_USERNAME`, `KEY=$GREENHOUSE_PROJECT_KEY`, `GH_ME=$(gh api user --jq .login)`. Then `GC status`.
+1. `DASH --detach`, then `eval "$(GC greenhouse-env)"`: `ME=$GREENHOUSE_TEAM_USERNAME`, `KEY=$GREENHOUSE_PROJECT_KEY`, `GH_ME=$(gh api user --jq .login)`. Then `GC status`.
 2. **Ticket named:** fetch it. It must be `changes_requested` with `assignee=$ME`.
    **None named:**
    `GET /rest/v1/tickets?project_id=eq.$GREENHOUSE_PROJECT_ID&status=eq.changes_requested&assignee=eq.$ME&select=display_id,title,pr_url,reviewer&order=updated_at.asc`.
    Drop anything claimed in `GC status`. Take the oldest. Nothing left → say so and stop (under `/loop`: end the tick with one line).
-3. Gate: `gh pr view <n> --json author,state,headRefName,baseRefName,mergeStateStatus,reviewRequests,reviews` ([common-operations §PR State Guard](../../references/common-operations.md#pr-state-guard)).
+3. Gate: `gh pr view <n> --json author,state,headRefName,baseRefName,mergeStateStatus,reviewRequests,reviews` ([common-operations §PR State Guard](common-operations.md#pr-state-guard)).
    - The PR must be OPEN and authored by `$GH_ME`. A collaborator's PR is never yours to fix.
    - If a re-review is already requested and pending, the round isn't over. Don't touch it.
 4. `eval "$(GC paths $KEY-{n})"`, then `GC claim $KEY-{n} $KEY-{n}/fix "$WT"`. `TAKEN` → next candidate.
@@ -31,10 +28,10 @@ Follow the protocol's §3.
 
 ## 3. Fix
 
-Invoke `/greenhouse:fix-review-feedback $KEY-{n}` with these overrides:
+Run fix-review-feedback's own steps from Step 4 on, with these overrides:
 - Classification: already answered above.
 - Its `git checkout`: overridden. You're already on the branch in the worktree.
-- BEHIND or CONFLICTING on base → [Inline Rebase](../../references/common-operations.md#inline-rebase) in the worktree. After any rebase, run the full gate, database section and its reset included.
+- BEHIND or CONFLICTING on base → [Inline Rebase](common-operations.md#inline-rebase) in the worktree. After any rebase, run the full gate, database section and its reset included.
 - Quality gate: split per the protocol's §4–5.
 - Migrations touched by a rebase or a fix: re-check against `GC migration-floor`.
 - Out-of-scope findings: listed only.

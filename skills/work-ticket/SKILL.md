@@ -1,11 +1,21 @@
 ---
-description: Start or implement a ticket. Asks whether to work interactively or autonomously based on ticket readiness. Use when starting work on a ticket, picking up a ticket, implementing autonomously, or working on something.
-argument-hint: "[ticket-id or search-term]"
+description: Start or implement a ticket. Asks whether to work interactively or autonomously based on ticket readiness. Use when starting work on a ticket, picking up a ticket, implementing autonomously, or working on something. With --agent, works the next tended ticket in its own worktree alongside other chats (gh-dash starts it this way).
+argument-hint: "[ticket-id or search-term] [--agent [reviewer <name>]]"
 ---
 
 # Skill: Work Ticket
 
 Pick up a ticket, plan, branch, and implement — interactively or autonomously based on ticket readiness.
+
+---
+
+## Mode: `--agent` (a parallel agent in its own worktree)
+
+When `--agent` is in the arguments (typed by the user, or started by gh-dash or a ticket page), run Step 0 (Preflight) as usual, then read [references/agent-work.md](../../references/agent-work.md) and follow it. It wins wherever this skill says otherwise. Without `--agent`, ignore that file and run as usual.
+
+- Agent mode claims a tended ticket assigned to you (the one named, or your next one), settles every question up front, then implements it autonomously in the ticket's own git worktree, alongside other chats on this machine, through gh-coord. It ends in an open PR.
+- Never switch to agent mode on your own. A general request ("work on RG-42", "implement it autonomously") is the normal skill below.
+- `GC` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord` and `DASH` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-dash`. The reference file uses these names: Claude Code fills in the plugin's path here, not in a file read later.
 
 ---
 

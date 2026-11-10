@@ -71,6 +71,14 @@ ${CLAUDE_PLUGIN_ROOT}/bin/gh-heartbeat
 
 Continue only on the user's say-so. A one-shot tend notes the wait in `open_decisions` and continues, since work-ticket's blocker check holds the work back anyway.
 
+**Show that it's being tended:** once the ticket is settled, label this chat with it, so the ticket's tile shows the tend pill wherever gh-dash runs (GH-133):
+
+```bash
+${CLAUDE_PLUGIN_ROOT}/bin/gh-coord working {TICKET-ID} tend 2>/dev/null || true
+```
+
+It's a label, not a claim: it never stops another chat from working the ticket, and without gh-dash nothing shows. Clear it on every way out (Step 7, a park or weed, or the user stopping the tend): `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord working - 2>/dev/null || true`.
+
 ---
 
 ## Step 2: Read Codebase Context
@@ -329,6 +337,8 @@ On approval:
 3. `POST /rest/v1/comments` (`author`: `${GREENHOUSE_TEAM_USERNAME}`; include `org_id` from `${GREENHOUSE_ORG_ID}` — RLS rejects the insert without it) — body is `"Tended by Claude Code. Expanded {N} acceptance criteria, added {M} test cases, identified {K} files to modify. Complexity: {N}pt {approach}. Ready for implementation."` plus any audit-finding notes. Use the temp-file + `--rawfile` pattern in [references/common-operations.md](../../references/common-operations.md) §Posting Comments and PATCHing Multi-line Ticket Fields — do NOT inline `--arg body "..."` because acceptance criteria and tending notes contain newlines.
 
 The same pattern applies to the PATCH in step 1 — `acceptance_criteria` and `description` are multi-line, so each goes through `--rawfile` against its own temp file.
+
+4. Clear the tend label from Step 1: `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord working - 2>/dev/null || true`.
 
 ---
 

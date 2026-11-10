@@ -503,11 +503,20 @@ function focusTerminal(name, done) {
       `if name of w contains ${appleString(name)} then set index of w to 1`, 'end repeat', 'end tell'], done);
 }
 
-function openInVscode(query) {
-  // The link opens in whichever VS Code window was used last, so bring this repo's window forward first.
-  execFile('code', [MAIN], { timeout: 10000 }, () => setTimeout(() => {
+// The link opens in whichever VS Code window was used last, so bring this repo's window forward
+// first: the `code` command, else (no `code` on the PATH) the app itself on a Mac. Neither → VS Code
+// isn't installed, and the start says so instead of opening nothing.
+function openInVscode(query, done = () => {}) {
+  const link = () => setTimeout(() => {
     execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [`vscode://anthropic.claude-code/open?${query}`]);
-  }, 600));
+    done(null);
+  }, 600);
+  execFile('code', [MAIN], { timeout: 10000 }, (err) => {
+    if (!err) return link();
+    if (process.platform !== 'darwin') return done(new Error(`VS Code isn't installed on ${MACHINE}`));
+    execFile('open', ['-a', 'Visual Studio Code', MAIN], { timeout: 10000 }, (err2) =>
+      err2 ? done(new Error(`VS Code isn't installed on ${MACHINE}`)) : link());
+  });
 }
 
 // A record for the chat before it ever calls gh-coord, so its card shows at once and a chat that
@@ -525,6 +534,10 @@ function preRecord(id, name, mode, kind, ticket) {
   } catch {}
 }
 
+// The skill each start runs; every kind but tend runs it with --agent (GH-133: the loop skills were
+// folded into the regular ones).
+const SKILL_OF = { work: 'work-ticket', fix: 'fix-review-feedback', review: 'review-pr', merge: 'merge-pr' };
+
 // With a ticket number, the skill runs once on that ticket. Without one, review, fix and merge start
 // a numbered 5-minute loop, and work picks the next tended ticket.
 function start(kind, ticket, mode, done) {
@@ -535,7 +548,7 @@ function start(kind, ticket, mode, done) {
   let name, run;
   if (ticket) {
     const base = kind === 'work' ? `${key}-${ticket}` : `${key}-${ticket} ${kind}`;
-    run = kind === 'tend' ? `/greenhouse:tend-ticket ${KEY}-${ticket}` : `/greenhouse:loop-${kind} ${KEY}-${ticket}`;
+    run = kind === 'tend' ? `/greenhouse:tend-ticket ${KEY}-${ticket}` : `/greenhouse:${SKILL_OF[kind]} ${KEY}-${ticket} --agent`;
     // An open chat on this ticket and kind ("<key>-129", "<key>-129 2", ...) comes forward instead.
     const already = open.find((s) => isNameOf(s.name, base));
     if (already) {
@@ -548,12 +561,14 @@ function start(kind, ticket, mode, done) {
     name = freeName(base, takenNames(open), false);
   } else {
     name = nextLoopNames(open)[kind];
-    run = kind === 'work' ? '/greenhouse:loop-work' : `/loop 5m /greenhouse:loop-${kind}`;
+    run = kind === 'work' ? '/greenhouse:work-ticket --agent' : `/loop 5m /greenhouse:${SKILL_OF[kind]} --agent`;
   }
   holdName(name);
   if (mode === 'vscode') {
-    openInVscode(`prompt=${encodeURIComponent(run)}`);
-    return done({ name, run, mode, enter: true });
+    return openInVscode(`prompt=${encodeURIComponent(run)}`, (err) => {
+      if (err) { holdName(name, false); return done({ error: err.message }); }
+      done({ name, run, mode, enter: true });
+    });
   }
   if (mode === 'terminal') {
     const id = randomUUID();
@@ -693,10 +708,10 @@ async function stopReport() {
   try { await rpc('report_agent_state', { ...reportPayload(reportState()), p_chats: [], p_stopping: true }); } catch {}
 }
 
-// Requests queued from a ticket page for this machine, taken until none is left. VS Code mode needs
-// someone at the keyboard to press Enter, so queued starts always run in terminal (or background,
-// when that's the mode). A nudge that arrives while a start runs asks for another pass, so a second
-// request queued meanwhile is taken right after, not at the next safety-net check.
+// Requests queued from a ticket page for this machine, taken until none is left. Each opens in the
+// mode the dashboard is set to when it's taken (GH-133), VS Code included: Greenhouse's message says
+// a VS Code start waits for Enter. A nudge that arrives while a start runs asks for another pass, so
+// a second request queued meanwhile is taken right after, not at the next safety-net check.
 async function queueTick() {
   if (!PROJECT_ID || !gh.creds || Date.now() < gh.backoffUntil) return;
   if (gh.polling) { gh.again = true; return; }
@@ -710,7 +725,7 @@ async function queueTick() {
       if (!r.ok && backOff(r, 'take_agent_start')) return;
       req = r.ok && Array.isArray(r.body) ? r.body[0] : null;
       if (req) {
-        const mode = readMode() === 'background' || !MODES.includes('terminal') ? 'background' : 'terminal';
+        const mode = readMode();
         const ticket = req.ticket_number ? String(req.ticket_number) : '';
         const out = await new Promise((resolve) => start(req.kind, ticket, mode, resolve));
         gh.started.unshift({ at: Date.now(), kind: req.kind, ticket, name: out.name, error: out.error || null });
@@ -802,7 +817,7 @@ function snapshot() {
     stack: stack.text, stackDown: !!LOCAL_STACK && !!stack.downSince && now - stack.downSince > STACK_GRACE_MS,
     dev: { merged: dev.merged.filter((m) => m.ts >= midnight()), error: dev.error },
     ...current, rows: rows(now, current), ...hist, machine: machine(), starts: nextLoopNames(openChats()),
-    modes: MODES, mode: readMode(),
+    modes: MODES, mode: readMode(), terminalApp: TERMINAL === 'iterm' ? 'iTerm' : 'Terminal',
     greenhouse: { state: gh.state, lastSent: gh.lastSent || null, error: gh.error, started: gh.started, live: rt.joined },
   };
 }
@@ -1418,30 +1433,37 @@ $('launch').addEventListener('click', function (e) {
   var b = e.target.closest('button');
   if (b) start(b.getAttribute('data-kind'));
 });
-var MODE_TIPS = {
-  terminal: 'a new terminal window, named, runs with no Enter, and shows in the Claude app (Remote Control)',
-  background: 'claude --bg: named, runs with no Enter, no window; claude attach <name> opens it, the Claude app shows it',
-  vscode: 'a VS Code tab with the command typed in: press Enter to run it'
-};
+// Every start opens this way, the ones Greenhouse sends included (GH-133). Terminal is Terminal.app
+// unless GREENHOUSE_TERMINAL=iterm was set when gh-dash started.
+function modeTip(m, app) {
+  if (m === 'terminal') {
+    return 'a new ' + app + (app === 'iTerm' ? ' tab' : ' window') + ', named, runs with no Enter, and shows in the Claude app (Remote Control). '
+      + (app === 'iTerm' ? 'For Terminal, unset GREENHOUSE_TERMINAL' : 'For iTerm, set GREENHOUSE_TERMINAL=iterm in your shell profile') + ' and restart gh-dash';
+  }
+  if (m === 'background') return 'claude --bg: named, runs with no Enter, no window; claude attach <name> opens it, the Claude app shows it';
+  return 'a VS Code tab in this project\'s window with the command typed in: press Enter to run it';
+}
 var currentMode = '', modesKey = '';
 function renderModes(s) {
   currentMode = s.mode;
-  var k = s.modes.join(',') + '|' + s.mode;
+  var k = s.modes.join(',') + '|' + s.mode + '|' + s.terminalApp;
   if (k === modesKey) return;
   modesKey = k;
   $('modes').innerHTML = '<span class="d">start in</span>' + s.modes.map(function (m) {
-    return '<button data-mode="' + m + '" class="' + (m === s.mode ? 'on' : '') + '" title="' + esc(MODE_TIPS[m]) + '">' + m + '</button>';
+    var label = m === 'terminal' ? s.terminalApp.toLowerCase() : m;
+    return '<button data-mode="' + m + '" class="' + (m === s.mode ? 'on' : '') + '" title="' + esc(modeTip(m, s.terminalApp)) + '">' + label + '</button>';
   }).join('');
 }
 $('modes').addEventListener('click', function (e) {
   var b = e.target.closest('button');
   if (!b) return;
   post('/api/mode', { mode: b.getAttribute('data-mode') })
-    .then(function (o) { if (o.error) hint('r', o.error); else { modesKey = ''; hint('d', 'starts now open in ' + o.mode + ' mode'); tick(); } });
+    .then(function (o) { if (o.error) hint('r', o.error); else { modesKey = ''; hint('d', 'starts now open in ' + o.mode + ' mode, Greenhouse\'s included'); tick(); } });
 });
 // The buttons say what a click starts: with a number, one pass of the skill on that ticket; without
 // one, a numbered loop for review, fix and merge, and work picks the next tended ticket.
 var nextNames = {};
+var SKILL_OF = { work: 'work-ticket', fix: 'fix-review-feedback', review: 'review-pr', merge: 'merge-pr' };
 function labelStarts() {
   var n = $('tk').value.replace(/\D/g, '');
   ['review', 'fix', 'merge', 'work', 'tend'].forEach(function (k) {
@@ -1449,10 +1471,11 @@ function labelStarts() {
     b.textContent = k + ' ' + (n || (loop ? 'loop' : k === 'work' ? 'next' : ''));
     b.disabled = k === 'tend' && !n;
     b.title = n
-      ? 'new chat ' + key + '-' + n + (k === 'work' ? '' : ' ' + k) + ' running ' + (k === 'tend' ? '/greenhouse:tend-ticket' : '/greenhouse:loop-' + k) + ' ' + KEY + '-' + n +
-        (k === 'merge' ? '\none pass: if CI is still running, a merge loop lands it' : '')
-      : loop ? 'new chat ' + (nextNames[k] || key + '-' + k + ' n') + ' running /loop 5m /greenhouse:loop-' + k
-      : k === 'work' ? 'new chat ' + (nextNames.work || key + '-work n') + ' running /greenhouse:loop-work; it picks the next tended ticket'
+      ? 'new chat ' + key + '-' + n + (k === 'work' ? '' : ' ' + k) + ' running '
+        + (k === 'tend' ? '/greenhouse:tend-ticket ' + KEY + '-' + n : '/greenhouse:' + SKILL_OF[k] + ' ' + KEY + '-' + n + ' --agent')
+        + (k === 'merge' ? '\none pass: if CI is still running, a merge loop lands it' : '')
+      : loop ? 'new chat ' + (nextNames[k] || key + '-' + k + ' n') + ' running /loop 5m /greenhouse:' + SKILL_OF[k] + ' --agent'
+      : k === 'work' ? 'new chat ' + (nextNames.work || key + '-work n') + ' running /greenhouse:work-ticket --agent; it picks the next tended ticket'
       : 'enter a ticket number to tend';
   });
 }

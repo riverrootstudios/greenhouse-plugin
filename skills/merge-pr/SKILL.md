@@ -1,6 +1,6 @@
 ---
-description: Squash-merge an approved PR you authored, clean up branches, and harvest the ticket in Greenhouse. Author-only — hands off if you didn't open the PR. Use when merging or landing an approved PR.
-argument-hint: "[pr-number]"
+description: Squash-merge an approved PR you authored, clean up branches, and harvest the ticket in Greenhouse. Author-only — hands off if you didn't open the PR. Use when merging or landing an approved PR. With --agent, runs one merge tick for /loop that applies merge conditions, waits for every CI job, and lands your approved PRs.
+argument-hint: "[pr-number] [--agent [dry]]"
 ---
 
 # Skill: Merge PR
@@ -9,6 +9,16 @@ Lands an already-approved PR. Split out from `review-pr` so the **author owns th
 merge** — the reviewer reviews, the author merges their own change. This skill
 never reviews; it gates on approval + CI + author identity, then squash-merges,
 cleans up, and harvests the ticket.
+
+---
+
+## Mode: `--agent` (one tick of a continuous merge)
+
+When `--agent` is in the arguments (typed by the user, started by gh-dash or a ticket page, or fired by a `/loop` tick), run Step 0 (Preflight) as usual, then read [references/agent-merge.md](../../references/agent-merge.md) and follow it. It wins wherever this skill says otherwise. Without `--agent`, ignore that file and run as usual.
+
+- Agent mode finds your own approved PRs into the integration branch or an epic branch (or the one ticket or PR named), applies their merge conditions, rebases, waits for every CI job to be green on the head, and lands them. `dry` reports what it would do, with no writes. Meant for `/loop 5m /greenhouse:merge-pr --agent`.
+- Never switch to agent mode on your own. A general request ("merge it") is the normal skill below.
+- `GC` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord` and `DASH` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-dash`. The reference file uses these names: Claude Code fills in the plugin's path here, not in a file read later.
 
 ---
 

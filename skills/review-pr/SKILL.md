@@ -1,6 +1,6 @@
 ---
-description: Review a PR against acceptance criteria and post an approve or request-changes verdict. Does NOT merge — the author lands it with /greenhouse:merge-pr. Also runs read-only against your own branch with --self before you hand off. Use when reviewing a PR, self-checking a branch, or requesting changes.
-argument-hint: "[pr-number] [--self]"
+description: Review a PR against acceptance criteria and post an approve or request-changes verdict. Does NOT merge — the author lands it with /greenhouse:merge-pr. Also runs read-only against your own branch with --self before you hand off. Use when reviewing a PR, self-checking a branch, or requesting changes. With --agent, runs one read-only review tick over the PRs waiting on you, for /loop.
+argument-hint: "[pr-number] [--self | --agent]"
 ---
 
 # Skill: Review PR
@@ -21,6 +21,16 @@ When invoked with `--self` (no PR number needed), run the reviewer's evaluation 
 - Frame the output as pre-handoff hygiene: "Here's what a reviewer will flag — fix before opening the PR." Then stop.
 
 For a normal PR review (a PR number, or no args), continue below.
+
+---
+
+## Mode: `--agent` (one tick of a continuous review)
+
+When `--agent` is in the arguments (typed by the user, started by gh-dash or a ticket page, or fired by a `/loop` tick), run Step 0 (Preflight) as usual, then read [references/agent-review.md](../../references/agent-review.md) and follow it. It wins wherever this skill says otherwise. Without `--agent`, ignore that file and run as usual.
+
+- Agent mode reviews the `in_review` tickets waiting on you at a head sha not yet reviewed (or the one ticket or PR named), read-only: it never touches a checkout or the local database. Meant for `/loop 5m /greenhouse:review-pr --agent`.
+- Never switch to agent mode on your own. A general request ("review PR 15") is the normal review below.
+- `GC` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord` and `DASH` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-dash`. The reference file uses these names: Claude Code fills in the plugin's path here, not in a file read later.
 
 ---
 

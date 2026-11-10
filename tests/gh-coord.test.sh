@@ -44,6 +44,20 @@ check "a second claim under a different label returns TAKEN" '[ $rc -eq 1 ] && [
 out=$(gc claim TST-1 TST-1/work "$ROOT/wt1"); rc=$?
 check "the same label re-claims as already mine" '[ $rc -eq 0 ] && [[ "$out" == *"already mine"* ]]' "rc=$rc out=$out"
 
+# ── working (GH-133: tend-ticket's pill) ───────────────────────────────────
+tend() { (cd "$REPO" && CLAUDE_CODE_SESSION_ID=s-tend "$COORD" "$@"); }
+tend working TST-20 tend >/dev/null
+rec="$GREENHOUSE_AGENTS_DIR/chats/s-tend"
+check "working sets the chat's ticket and role without a claim" \
+  'grep -q "^ticket=TST-20$" "$rec" && grep -q "^role=tend$" "$rec" && [ ! -e "$GREENHOUSE_AGENTS_DIR/claims/TST-20" ]' "$(cat "$rec" 2>/dev/null)"
+out=$(gc claim TST-20 TST-20/work "$ROOT/wt20"); rc=$?
+check "a ticket someone is tending can still be claimed" '[ $rc -eq 0 ] && [ "$out" = CLAIMED ]' "rc=$rc out=$out"
+gc unclaim TST-20 TST-20/work >/dev/null
+tend working - >/dev/null
+check "working - clears the chat's ticket and role" '! grep -q "^ticket=" "$rec" && ! grep -q "^role=" "$rec"' "$(cat "$rec")"
+out=$(tend working TST-20 tending 2>&1); rc=$?
+check "working refuses a role gh-dash doesn't know" '[ $rc -eq 64 ]' "rc=$rc out=$out"
+
 # ── DB lock ────────────────────────────────────────────────────────────────
 mkdir -p "$ROOT/gone-wt"
 gc db-acquire TST-2/work "$ROOT/gone-wt" "seed" >/dev/null

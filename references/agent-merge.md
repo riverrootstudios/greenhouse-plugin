@@ -1,27 +1,24 @@
----
-description: One tick of a continuous merge loop. Finds my own approved PRs into the integration branch or an epic branch, applies their merge conditions (code included), rebases, waits for every CI job to be green on the head, and lands them with /greenhouse:merge-pr. Meant for /loop. User-invoked only — run it when the user types /greenhouse:loop-merge, gh-dash starts it, or a /loop tick fires it, never on a general request to merge a PR (use /greenhouse:merge-pr for that).
-argument-hint: "[KEY-n | PR#] [dry]"
----
+# Agent mode: merge-pr --agent
 
-# Loop: continuous merge tick
+Loaded by `/greenhouse:merge-pr --agent`. Binding for the whole chat.
 
-Arguments: `$ARGUMENTS` (empty = scan my approved PRs; a ticket or PR = just that one; `dry` = report what each PR needs and what this tick would do, with no writes of any kind)
+Arguments: the skill's arguments, minus `--agent` (empty = scan my approved PRs; a ticket or PR = just that one; `dry` = report what each PR needs and what this tick would do, with no writes of any kind)
 
-Run under `/loop` (`/loop 5m /greenhouse:loop-merge`, or `/loop /greenhouse:loop-merge` to self-pace). Each invocation is one tick. Other chats on this machine are working, fixing and reviewing tickets in worktrees. Read [references/parallel-agents.md](../../references/parallel-agents.md) now: it's binding for this whole chat and wins wherever another skill says otherwise. `GC` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord`. "The user" is whoever launched this chat.
+Run under `/loop` (`/loop 5m /greenhouse:merge-pr --agent`, or `/loop /greenhouse:merge-pr --agent` to self-pace). Each invocation is one tick. Other chats on this machine are working, fixing and reviewing tickets in worktrees. Read [references/parallel-agents.md](parallel-agents.md) now: it's binding for this whole chat and wins wherever another skill says otherwise. `GC` and `DASH` are the gh-coord and gh-dash paths the skill's agent-mode section gave. "The user" is whoever launched this chat.
 
 ## Hard rules
 
 - Merge only into the integration branch (`BASE` in `GC config`) or `epic/*`. Never `main` when it isn't the integration branch, never `release/*`, never a stacked PR's feature-branch base. Never tag, promote, or open an epic PR.
 - Only PRs authored by `$GH_ME`. A collaborator's PR is never yours to merge.
-- Never merge content the reviewer didn't see (§2a), except the changes this skill makes to meet the approval's merge conditions (§2c), each mapped to its sha in a PR comment. Never dismiss a review.
+- Never merge content the reviewer didn't see (§2a), except the changes agent mode makes to meet the approval's merge conditions (§2c), each mapped to its sha in a PR comment. Never dismiss a review.
 - **An approval means do the conditions, then merge.** Never send an approved PR back to `changes_requested` or to a fix chat, and never ask the reviewer to look again. Every CI job green on the head is the gate.
 - Never touch `$MAIN` (protocol §2) and never start the dev server. The ticket's worktree is usually all a tick needs. Take the DB lock only for a database-touching change (§3.6), and release it right after.
 - Never create a ticket. Never make a behavior change that neither the review nor the user asked for.
-- Invoking this skill is the user's go-ahead for merge-pr's confirmation step and for any deploy a merge to the integration branch fires. That go-ahead covers only PRs that pass every gate below.
+- `--agent` is the user's go-ahead for merge-pr's confirmation step and for any deploy a merge to the integration branch fires. That go-ahead covers only PRs that pass every gate below.
 
 ## 1. Find candidates
 
-1. `${CLAUDE_PLUGIN_ROOT}/bin/gh-dash --detach`, then `eval "$(GC greenhouse-env)"`: `ME=$GREENHOUSE_TEAM_USERNAME`, `KEY=$GREENHOUSE_PROJECT_KEY`, `GH_ME=$(gh api user --jq .login)`. Then `GC status` and `GC config`.
+1. `DASH --detach`, then `eval "$(GC greenhouse-env)"`: `ME=$GREENHOUSE_TEAM_USERNAME`, `KEY=$GREENHOUSE_PROJECT_KEY`, `GH_ME=$(gh api user --jq .login)`. Then `GC status` and `GC config`.
 2. `gh pr list --author @me --state open --json number,title,headRefName,baseRefName,reviewDecision,isDraft,labels,mergeStateStatus,headRefOid,body`. Keep the PRs that are `APPROVED`, not a draft, without a `hold` label, and based on `$BASE` or `epic/*`. A ticket or PR in the arguments narrows this to that one.
 3. Resolve the ticket from `Implements $KEY-{n}` in the body. It must be `assignee=$ME` and not `harvest` or `weeded`. Drop any ticket claimed in `GC status` under a label other than `$KEY-{n}/merge` (a work or fix chat has it).
 4. Nothing left → one line ("nothing approved") and end the tick.
@@ -29,9 +26,9 @@ Run under `/loop` (`/loop 5m /greenhouse:loop-merge`, or `/loop /greenhouse:loop
 
 ## 2. Gate each candidate (read-only)
 
-Read the ticket's latest `gh-loop merge` comment (§4) if there is one. It holds what earlier ticks recorded: the approved sha, the sha this skill pushed, the head a rerun was spent on, and any parked question.
+Read the ticket's latest `gh-loop merge` comment (§4) if there is one. It holds what earlier ticks recorded: the approved sha, the sha agent mode pushed, the head a rerun was spent on, and any parked question.
 
-**a. The approval covers the head.** Take the latest approving review's `commit.oid` (`gh pr view <n> --json reviews,headRefOid`). The head must equal it, or equal the last sha this skill pushed. Otherwise `git -C "$MAIN" fetch origin` and `git range-diff` from the approved commit to the head. It may show only a rebase (patches unchanged) plus this skill's own commits. Anything else → park: "head changed after approval, needs re-review".
+**a. The approval covers the head.** Take the latest approving review's `commit.oid` (`gh pr view <n> --json reviews,headRefOid`). The head must equal it, or equal the last sha agent mode pushed. Otherwise `git -C "$MAIN" fetch origin` and `git range-diff` from the approved commit to the head. It may show only a rebase (patches unchanged) plus agent mode's own commits. Anything else → park: "head changed after approval, needs re-review".
 
 **b. Collect the conditions.**
 - The approving review's `## Merge conditions` section.
@@ -48,7 +45,7 @@ Read the ticket's latest `gh-loop merge` comment (§4) if there is one. It holds
   - **File it** → `/greenhouse:create-ticket`, then link the ticket in the PR body.
   - **Done** (the user ran the production check, looked at the dashboard, and so on) → mark it met.
 
-**d. CI on the head, every job.** Run [common-operations §CI on the Current Head](../../references/common-operations.md#ci-on-the-current-head), then `gh run view <id> --json jobs`. Every job must be `success`, not only the required ones. Pending → wait for a later tick. On a failure, run `gh run rerun <id> --failed` once per head sha and record that the rerun was spent. A second failure on the same head → park, name the failing test, and propose a flake ticket. Don't create it.
+**d. CI on the head, every job.** Run [common-operations §CI on the Current Head](common-operations.md#ci-on-the-current-head), then `gh run view <id> --json jobs`. Every job must be `success`, not only the required ones. Pending → wait for a later tick. On a failure, run `gh run rerun <id> --failed` once per head sha and record that the rerun was spent. A second failure on the same head → park, name the failing test, and propose a flake ticket. Don't create it.
 
 **e. Freshness.** `mergeStateStatus` BEHIND or DIRTY → it needs a rebase (§3).
 
@@ -61,7 +58,7 @@ Read the ticket's latest `gh-loop merge` comment (§4) if there is one. It holds
    - `$WT` exists on the PR branch → it must be clean or hold only unpushed work you can account for, and not mid-rebase. Then `git pull --ff-only`. If the pull refuses, find out why. Don't reset.
    - No worktree → `git -C "$MAIN" worktree add "$WT" <headRefName>`, then `GC worktree-setup "$WT"` and the install step there. The branch is checked out in `$MAIN` → park and ask.
    - **Don't EnterWorktree.** This chat moves between tickets and removes worktrees after merge. Prefix every Bash command with `cd "$WT" &&`, use absolute `$WT` paths for Read and Edit, and check `pwd` and `git branch --show-current` before every commit.
-3. BEHIND or DIRTY → [Inline Rebase](../../references/common-operations.md#inline-rebase) onto `origin/<base>`. Resolve only mechanical conflicts: the lockfile (regenerate it), migration numbering, both sides adding imports or list entries. A conflict that chooses between two behaviors → `git rebase --abort`, park, ask.
+3. BEHIND or DIRTY → [Inline Rebase](common-operations.md#inline-rebase) onto `origin/<base>`. Resolve only mechanical conflicts: the lockfile (regenerate it), migration numbering, both sides adding imports or list entries. A conflict that chooses between two behaviors → `git rebase --abort`, park, ask.
 4. Migrations: if one of the PR's migrations is at or below the highest on `origin/<base>`, renumber it above `GC migration-floor` and fix references to the old name. If one replaces a function the base also changed since the branch point → park.
 5. Apply the conditions: files, `gh pr edit` for the title and body, a Greenhouse PATCH for this ticket's fields.
 6. Local checks scale with the change:
@@ -77,9 +74,9 @@ Read the ticket's latest `gh-loop merge` comment (§4) if there is one. It holds
 
 ## 4. Merge
 
-Merge when all of these hold: the head equals the approved sha or the sha this skill recorded, every CI job is green on it, the PR isn't BEHIND or DIRTY, and every condition is met or answered. Re-read `mergeStateStatus` right before merging: the base may have moved, in which case go back to §3.
+Merge when all of these hold: the head equals the approved sha or the sha agent mode recorded, every CI job is green on it, the PR isn't BEHIND or DIRTY, and every condition is met or answered. Re-read `mergeStateStatus` right before merging: the base may have moved, in which case go back to §3.
 
-Invoke `/greenhouse:merge-pr <PR#>` with these overrides:
+Run merge-pr's own steps from Step 3 on, with these overrides:
 - The confirmation is already answered. Its condition list is the one §2 verified, and its CI gate is §2d (every job).
 - Branch cleanup: never checkout or pull in `$MAIN`. Instead `git -C "$MAIN" fetch origin`, then `git -C "$MAIN" worktree remove "$WT"` if it's clean (otherwise leave it and say so). Once the PR reads MERGED, `git -C "$MAIN" branch -D <branch>` (a squash isn't an ancestor, so `-d` refuses), and `git push origin --delete <branch>` if GitHub kept it.
 - Harvest as written, and tick the acceptance criteria the review said to tick at merge. Epic check: report progress only, never open the epic PR.
@@ -87,7 +84,7 @@ Invoke `/greenhouse:merge-pr <PR#>` with these overrides:
 
 Then `GC unclaim $KEY-{n} $KEY-{n}/merge`, and go on to the next candidate in the same tick: the rest are now BEHIND.
 
-**Record** each tick's progress on a PR in one Greenhouse comment on its ticket (comment pattern in [common-operations](../../references/common-operations.md#posting-comments-and-patching-multi-line-ticket-fields), `author` `${GREENHOUSE_TEAM_USERNAME}`): what this tick did, plus a marker the next tick reads.
+**Record** each tick's progress on a PR in one Greenhouse comment on its ticket (comment pattern in [common-operations](common-operations.md#posting-comments-and-patching-multi-line-ticket-fields), `author` `${GREENHOUSE_TEAM_USERNAME}`): what this tick did, plus a marker the next tick reads.
 
 ```
 Loop merge: {rebased and pushed {short sha}, CI pending | conditions applied at {short sha} | parked: {question} | merged at {squash sha}; walk owed: {walk}}

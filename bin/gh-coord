@@ -37,6 +37,8 @@
 #   gh-coord heavy-run       <label> -- <cmd...>          run cmd in one of the heavy slots; waits for a free one
 #   gh-coord claim           <ticket> <label> <worktree>  exit 0 claimed (or already mine), 1 taken
 #   gh-coord unclaim         <ticket> <label>
+#   gh-coord working         <ticket> <role> | -          label this chat's ticket and role without a claim (GH-133:
+#                                                         tend-ticket's pill); `-` clears them. Never blocks anyone
 #   gh-coord migration-floor                              highest migration version across origin/<base> + every worktree
 #   gh-coord needs-you       [<notification type>]        from the plugin's Notification hook (JSON on stdin)
 #   gh-coord seen                                         from the plugin's PostToolUse/UserPromptSubmit hooks: the chat is
@@ -407,6 +409,12 @@ case "$cmd" in
     if [ "$(field "$c" label)" = "$2" ]; then
       rm -rf "$c"; log "unclaim $1 by $2"; chat_set "ticket=" "label=" "doing=" "last_ticket=$1"; echo "UNCLAIMED"
     else echo "NOT CLAIMANT" >&2; exit 3; fi
+    ;;
+  working)
+    [ $# -ge 1 ] || { echo "usage: working <ticket> <role> | working -" >&2; exit 64; }
+    if [ "$1" = - ]; then chat_set "ticket=" "role=" "label=" "doing="; echo "CLEARED"; exit 0; fi
+    case "${2:-}" in work|fix|review|merge|tend) ;; *) echo "usage: working <ticket> <work|fix|review|merge|tend>" >&2; exit 64 ;; esac
+    chat_set "ticket=$1" "role=$2" "label=$1/$2"; echo "WORKING"
     ;;
   migration-floor)
     [ -d "$MAIN/supabase/migrations" ] || exit 0

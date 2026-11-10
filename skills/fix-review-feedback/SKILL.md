@@ -1,6 +1,6 @@
 ---
-description: Address PR review comments autonomously. Reads feedback, implements fixes, re-requests review. Use when fixing review comments, addressing feedback, or handling review.
-argument-hint: "[ticket-id]"
+description: Address PR review comments autonomously. Reads feedback, implements fixes, re-requests review. Use when fixing review comments, addressing feedback, or handling review. With --agent, fixes one of your PRs in its ticket's own worktree alongside other chats (gh-dash and /loop start it this way).
+argument-hint: "[ticket-id] [--agent [hold]]"
 ---
 
 # Skill: Fix Review Feedback
@@ -8,6 +8,16 @@ argument-hint: "[ticket-id]"
 Autonomously address PR review comments: parse structured `[REQUIRED]`/`[NOTED]` findings, implement all required fixes, re-request review. Designed to consume the structured output from `review-pr` without interpretation.
 
 **Fix only what the review raised.** Adjacent issues you notice along the way — a nearby bug, a stale comment, a refactor the fix invites — go into the out-of-scope findings list ([common-operations §Out-of-Scope Findings](../../references/common-operations.md#out-of-scope-findings)), shown in the Step 9 summary. They are not fixed in this round and no ticket is filed without a yes.
+
+---
+
+## Mode: `--agent` (a parallel agent in its own worktree)
+
+When `--agent` is in the arguments (typed by the user, started by gh-dash or a ticket page, or fired by a `/loop` tick), run Step 0 (Preflight) as usual, then read [references/agent-fix.md](../../references/agent-fix.md) and follow it. It wins wherever this skill says otherwise. Without `--agent`, ignore that file and run as usual.
+
+- Agent mode takes one of your PRs with changes requested (the one named, or your oldest), settles every question up front, then fixes it in the ticket's own git worktree, alongside other chats on this machine, through gh-coord. `hold` pushes the fixes without re-requesting review.
+- Never switch to agent mode on your own. A general request ("fix the review comments") is the normal skill below.
+- `GC` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord` and `DASH` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-dash`. The reference file uses these names: Claude Code fills in the plugin's path here, not in a file read later.
 
 ---
 

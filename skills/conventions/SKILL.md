@@ -1,6 +1,6 @@
 ---
 description: RiverRoot Studios shared development conventions. Config loading, Greenhouse access patterns, branch naming, commit format, labeling philosophy, epic usage, traceability chain. Background knowledge for all RRS skills.
-user-invokable: false
+user-invocable: false
 ---
 
 # RiverRoot Studios — Shared Conventions

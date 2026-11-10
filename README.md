@@ -160,19 +160,22 @@ Every link is maintained by a skill. `open-pr`'s ticket gate stops a PR without 
 | Skill | What it does |
 |-------|-------------|
 | **dashboard** | What's in flight across all projects |
+| **sync-usage** | Sync your Claude Code token usage to Greenhouse |
 | **health-check** | Branch and worktree cleanup, integration-branch build, Greenhouse↔GitHub sync verification |
 | **release** | Generate notes from harvested tickets, open the promotion PR (`release_flow: promotion-pr`), tag, and watch what the tag fires |
 
 ### Parallel Agents
 
-User-invoked only. See [Parallel agents](#parallel-agents-optional) for setup.
+`work-ticket`, `fix-review-feedback`, `review-pr` and `merge-pr` each take `--agent`, which runs them as one of several chats on this machine, each in its own worktree. Agent mode runs only when `--agent` is given, never on a plain request. See [Parallel agents](#parallel-agents-optional) for setup.
 
-| Skill | What it does |
-|-------|-------------|
-| **loop-work** | Claim the next tended ticket assigned to you and implement it autonomously in its own worktree |
-| **loop-fix** | Address review feedback on one of your PRs in its ticket's worktree |
-| **loop-review** | One read-only review tick: review PRs waiting on you at a head you haven't reviewed |
-| **loop-merge** | One merge tick: apply an approved PR's merge conditions, wait for every CI job, land it |
+| Command | What it does |
+|---------|-------------|
+| `/greenhouse:work-ticket [KEY-n] --agent [reviewer <name>]` | Claim a tended ticket assigned to you (your next one when none is named) and implement it autonomously in its own worktree |
+| `/greenhouse:fix-review-feedback [KEY-n] --agent [hold]` | Address review feedback on one of your PRs in its ticket's worktree |
+| `/greenhouse:review-pr [KEY-n \| PR#] --agent` | One read-only review tick: review PRs waiting on you at a head you haven't reviewed |
+| `/greenhouse:merge-pr [KEY-n \| PR#] --agent [dry]` | One merge tick: apply an approved PR's merge conditions, wait for every CI job, land it |
+
+Review, fix and merge run under `/loop`: `/loop 5m /greenhouse:review-pr --agent` (the same for `fix-review-feedback` and `merge-pr`).
 
 ---
 
@@ -200,7 +203,12 @@ Without `local_stack` the DB lock turns off and the chats skip it.
 
 ### Start the dashboard
 
-From any Claude Code chat in the repo, type `! gh-dash --detach --open` (the plugin's `bin/` is on the chat's PATH). It keeps running after the chat closes, and every loop skill starts it if it isn't running. It serves `http://127.0.0.1:7777` on this machine only.
+- **From a terminal** in the project's folder: `"$(ls -d ~/.claude/plugins/cache/riverroot/greenhouse/*/ | sort -V | tail -1)bin/gh-dash" --detach --open`. gh-dash isn't on your PATH outside Claude Code; this picks the newest installed plugin version.
+- **Inside a Claude Code chat** in the repo: `! gh-dash --detach` (the plugin's `bin/` is on the chat's PATH).
+
+It keeps running after the chat or terminal closes, and every `--agent` run starts it if it isn't running. It serves `http://127.0.0.1:7777` on this machine only.
+
+Starts open in whatever mode the dashboard is set to (Terminal, VS Code or background; see [Starting chats](#starting-chats)), including starts from Greenhouse. Terminal uses iTerm when `GREENHOUSE_TERMINAL=iterm` is set in your shell profile. VS Code starts open with the command typed in and need Enter.
 
 **While gh-dash runs, Greenhouse can see this machine.** It reports only when something changes (there's no heartbeat), so a quiet machine costs nothing. Stop it and its chats end at once; if the machine sleeps or crashes, it shows offline after 10 minutes. A chat closed while it still holds a ticket ends an hour after its last `gh-coord` call (the dashboard offers the `gh-coord unclaim` line). Ticket status is unaffected either way, because the skills write that themselves. `gh-dash --report-preview` prints exactly what it sends: per chat its session id, name, ticket, role, what it's doing, needs-you, folder name and start time; per machine its heavy slots (how many, who holds each and what it runs), the DB lock and who's waiting, the stack and its start mode. Never transcript or prompt text, file contents, env values, CPU or memory, process lists or full paths. CPU, memory and busy/idle stay on the local page.
 
@@ -214,7 +222,7 @@ Type a ticket number into the dashboard's `$ <key>-` prompt and click a button, 
 | **background** | `claude --bg`: named, runs with no Enter, no window. `claude attach <name>` opens it |
 | **vscode** | A VS Code tab with the command typed in. Press Enter once — the extension's link can't send it |
 
-From Greenhouse, a ticket's start buttons (tend, work, review, fix, merge, right under its title on the corkboard pane and the kanban modal) queue a request that reaches your gh-dash at once. They show only while one of your machines is online. The request travels over Supabase Realtime, on a private topic only you can join, and starts in terminal (or background) mode. Without a Realtime connection gh-dash checks the queue every minute instead. Requests carry only a kind and a ticket — never free text — and expire after 10 minutes. **Open in VS Code** opens the command in VS Code on whichever machine you clicked it.
+From Greenhouse, a ticket's start buttons (tend, work, review, fix, merge: in the corkboard header with the ticket selected or open, and under its title in the kanban modal) queue a request that reaches your gh-dash at once. They show only while one of your machines is online. The request travels over Supabase Realtime, on a private topic only you can join, and starts in the dashboard's mode. Without a Realtime connection gh-dash checks the queue every minute instead. Requests carry only a kind and a ticket — never free text — and expire after 10 minutes. **Open in VS Code** opens the command in VS Code on whichever machine you clicked it.
 
 ### Known limits
 
@@ -312,7 +320,7 @@ plugin/
 │   ├── plugin.json              # Plugin manifest
 │   └── marketplace.json         # Marketplace catalog
 ├── skills/
-│   ├── conventions/SKILL.md     # Shared conventions (background knowledge, not user-invokable)
+│   ├── conventions/SKILL.md     # Shared conventions (background knowledge, not user-invocable)
 │   ├── create-ticket/SKILL.md
 │   ├── tend-ticket/SKILL.md
 │   ├── sow-feedback/SKILL.md
@@ -324,13 +332,14 @@ plugin/
 │   ├── merge-pr/SKILL.md
 │   ├── setup/SKILL.md
 │   ├── dashboard/SKILL.md
+│   ├── sync-usage/SKILL.md
 │   ├── health-check/SKILL.md
-│   ├── release/SKILL.md
-│   └── loop-{work,fix,review,merge}/SKILL.md  # Parallel agents (optional)
+│   └── release/SKILL.md
 ├── bin/                         # gh-jwt, gh-heartbeat, gh-coord, gh-dash
 ├── hooks/hooks.json             # Notification hook: marks a parallel-agent chat as needing you
 ├── tests/gh-coord.test.sh       # Coordinator smoke tests (run in CI)
 ├── references/                  # Tech stack, schemas, gates, conventions
+│   └── agent-{work,fix,review,merge}.md  # The --agent modes (parallel agents, optional)
 ├── templates/                   # PR, ticket, plan, release note templates
 ├── LICENSE                      # MIT
 └── README.md

@@ -1,6 +1,6 @@
 # Parallel agents on one machine
 
-**Used by:** `loop-work`, `loop-fix`, `loop-review`, `loop-merge` (GH-129). Binding on every chat those skills run in, and it wins wherever another skill says otherwise.
+**Used by:** the `--agent` mode of `work-ticket`, `fix-review-feedback`, `review-pr` and `merge-pr` (GH-129). Binding on every chat that runs one of them with `--agent`, and it wins wherever another skill says otherwise.
 
 Several Claude Code chats work the same project at once on one machine: some implement tickets, some fix review feedback, one reviews, one merges. Three things on the machine can't be shared safely:
 
@@ -90,4 +90,4 @@ When the user resets or tests from the main checkout, they take the lock too: `G
 
 ## 9. Under `/loop`
 
-Each invocation is one tick. Settle every question at the start of a chat, while the user is still at the keyboard; after that a tick never stops to ask. A question that comes up later is asked once, in one batched message with a recommendation for each item. Later ticks print one line (`{KEY}-{n}: still waiting on your answer above`) and keep working other tickets. A quiet tick (nothing to do) is one line.
+Review, fix and merge chats run under `/loop`: `/loop 5m /greenhouse:review-pr --agent`, `/loop 5m /greenhouse:fix-review-feedback --agent` or `/loop 5m /greenhouse:merge-pr --agent` (leave out the interval to self-pace). Each invocation is one tick. Settle every question at the start of a chat, while the user is still at the keyboard; after that a tick never stops to ask. A question that comes up later is asked once, in one batched message with a recommendation for each item. Later ticks print one line (`{KEY}-{n}: still waiting on your answer above`) and keep working other tickets. A quiet tick (nothing to do) is one line.
