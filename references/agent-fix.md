@@ -17,7 +17,8 @@ You are one of several chats working this project in parallel on this machine. R
    - The PR must be OPEN and authored by `$GH_ME`. A collaborator's PR is never yours to fix.
    - If a re-review is already requested and pending, the round isn't over. Don't touch it.
 4. `eval "$(GC paths $KEY-{n})"`, then `GC claim $KEY-{n} $KEY-{n}/fix "$WT"`. `TAKEN` → next candidate.
-5. **Settle every question now.** Read all the feedback: GitHub reviews, inline comments, Greenhouse comments. Classify human-prose comments as `[REQUIRED]` or skip, the way fix-review-feedback would ask, in **one** batched message with your recommendation for each. Same for any `[REQUIRED]` that asks for a new ticket: propose it, never create it. Structured `[REQUIRED]` items with a `Fix:` need no question. If nothing needs asking, carry on without waiting.
+5. **Sort the questions out now.** Read all the feedback: GitHub reviews, inline comments, Greenhouse comments. Structured `[REQUIRED]` items with a `Fix:` need no question: they're the person-free work. Human-prose comments need the user to classify them as `[REQUIRED]` or skip, the way fix-review-feedback would ask; so does any `[REQUIRED]` that asks for a new ticket (propose it, never create it). Those are this run's judgment items, asked in one box after the person-free work (§3).
+   - Nothing needs asking → carry on without a box.
 
 ## 2. Worktree
 
@@ -29,7 +30,7 @@ Follow the protocol's §3.
 ## 3. Fix
 
 Run fix-review-feedback's own steps from Step 4 on, with these overrides:
-- Classification: already answered above.
+- Classification: structured items first. Implement every `[REQUIRED]` with a `Fix:` (lock-free), then, with any judgment items left from §1.5, ask them in one box ([common-operations §Asking the User](common-operations.md#asking-the-user)): one question per comment, quoted above it, up to 4 (more go in further boxes of up to 4, all answered before the gate and the push), and **wait for the answer** before going on. A box that comes back unanswered is asked again, never decided. Record the answers in the round's Greenhouse comment, then implement the ones marked `[REQUIRED]`. One gate and one push cover both.
 - Its `git checkout`: overridden. You're already on the branch in the worktree.
 - BEHIND or CONFLICTING on base → [Inline Rebase](common-operations.md#inline-rebase) in the worktree. After any rebase, run the full gate, database section and its reset included.
 - Quality gate: split per the protocol's §4–5.
@@ -46,6 +47,7 @@ Run fix-review-feedback's own steps from Step 4 on, with these overrides:
 ## Under /loop
 
 Each tick: if this chat already holds a claim, keep going on that ticket. Otherwise run §1. One ticket per tick; don't start a second while one is mid-flight.
-- Waiting on the user's answer to a §1.5 question: the tick prints one line (`$KEY-{n}: still waiting on your answer above`) and ends. Don't re-ask in full, and don't pick up another PR.
+- A tick's first command is `GC tick` and its last is `GC tick <minutes to the next tick>` ([parallel-agents §9](parallel-agents.md#9-under-loop)). A one-shot run skips both.
+- A tick with judgment items asks them in its box (§3) and waits there: no other tick fires while the box is open, and the tick doesn't pick up another PR.
 - A `hold` given to `/loop` applies to every PR the loop handles.
 - A quiet tick ends with one line. Under self-paced `/loop`, the next wakeup is about 20 minutes out.

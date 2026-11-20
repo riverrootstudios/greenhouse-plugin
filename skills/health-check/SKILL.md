@@ -62,8 +62,7 @@ Before running other checks (which depend on config), verify the project's CLAUD
 
 ### Repair
 
-For each missing or outdated section, offer to inject it from the template:
-> "CLAUDE.md is missing {section}. Inject from template?"
+For each missing or outdated section, offer to inject it from the template, as a confirm ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): *"CLAUDE.md is missing {section}."*, then a box (several sections: one question each, up to 4) with **Inject it** (recommended) and **Leave it**.
 
 **A stale Team table** gets its own prompt (see [Team table validation](#team-table-validation)), because the consequence isn't cosmetic — a repo whose CLAUDE.md still resolves the acting user from the Team table writes nicknames, initials and GitHub logins into attribution columns (Robin as `robin`, Sam as `sk`), which split one person into several avatars and make RLS reject non-owner members' time entries.
 
@@ -93,7 +92,9 @@ A two-column table whose values are all real usernames passes silently; a single
 
 Then offer the rewrite, showing the proposed section — the template's Team heading, the rows converted to `| {closest match} | {GitHub} |`, and the template's paragraph beneath:
 
-> "Rewrite `{repo}/CLAUDE.md`'s Team section in the two-column format (and drop the `gh api user` line)? Rows with no directory match are left for you to fill in."
+> "This rewrites `{repo}/CLAUDE.md`'s Team section in the two-column format and drops the `gh api user` line. Rows with no directory match are left for you to fill in."
+
+Then a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): **Rewrite it** (recommended) or **Leave it**.
 
 ### Convert old-style project setup → new style
 
@@ -105,7 +106,7 @@ The repo-side of onboarding used to be handled by `init-project` (now removed). 
 2. **Stale env-var onboarding** — if CLAUDE.md still lists the three `GREENHOUSE_*` env vars as required setup, replace that bullet with the `/greenhouse:setup` onboarding line from the template.
 3. **Missing plugin auto-install** — if `.claude/settings.json` lacks the marketplace/enable block, offer to add the block from the plugin README's [Install for a whole project](../../README.md#install-for-a-whole-project) section (merging with any existing settings), so teammates get the plugin on folder-trust instead of a `--plugin-dir` alias.
 
-Present these as a batch: *"This repo uses the old-style Greenhouse setup ({findings}). Convert to the new style (setup-token onboarding + auto-install)?"* — apply on confirmation. Credential migration for the developer's own machine (env vars → `~/.greenhouse/config`) is handled by `/greenhouse:setup`, not here.
+Present these as a batch — *"This repo uses the old-style Greenhouse setup ({findings})."* — then a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): **Convert to the new style** (setup-token onboarding + auto-install; recommended) or **Leave it**. Apply on that yes. Credential migration for the developer's own machine (env vars → `~/.greenhouse/config`) is handled by `/greenhouse:setup`, not here.
 
 ### Greenhouse validation
 
@@ -255,8 +256,7 @@ If no recent commits → flag as stale.
 - {issue}: {fix}
 ```
 
-Offer to fix all found issues:
-> "Found {N} issues. Fix all / fix some / skip?"
+Offer to fix the issues found, as a confirm over the report above ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): header `Health`, question `Health: fix the {N} issues found?`, options **Fix all** (recommended), **Fix some** (named in the free text) and **Skip**.
 
 **Auto-fixable:**
 - Delete stale branches (local + remote)
@@ -291,8 +291,7 @@ fi
 
 ## Optional: Complexity Scoring
 
-After the standard report, ask:
-> "Want complexity scoring on recent merges? This compares predicted vs. actual complexity for tickets merged in the last 7 days."
+After the standard report, ask in a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): *"Complexity scoring compares predicted vs. actual complexity for tickets merged in the last 7 days."*, options **Skip** (recommended) and **Score recent merges**.
 
 If yes:
 

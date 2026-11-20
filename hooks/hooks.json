@@ -1,5 +1,5 @@
 {
-  "description": "GH-129: marks a parallel-agent chat as needing you when Claude Code raises a Notification, and clears it once the chat runs a tool or gets a prompt (gh-dash and the Greenhouse Agents page show it). A fast no-op in any session gh-coord hasn't marked.",
+  "description": "GH-129/GH-134: marks a parallel-agent chat as needing you while an AskUserQuestion box is open (PreToolUse sets it, the box's PostToolUse clears it) or when Claude Code raises a Notification, and clears a Notification's mark once the chat runs a tool or gets a prompt (gh-dash and the Greenhouse Agents page show it). A fast no-op in any session gh-coord hasn't marked.",
   "hooks": {
     "Notification": [
       {
@@ -43,7 +43,29 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/gh-coord\" needs-you question",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
+      {
+        "matcher": "AskUserQuestion",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/gh-coord\" seen box",
+            "timeout": 5
+          }
+        ]
+      },
       {
         "hooks": [
           {
@@ -59,7 +81,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/gh-coord\" seen",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/gh-coord\" seen prompt",
             "timeout": 5
           }
         ]

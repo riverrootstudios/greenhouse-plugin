@@ -77,18 +77,17 @@ gh pr view {number} --json state,isDraft,mergedAt,mergeCommit,closedAt,title,bod
 ```bash
 gh pr list --json number,title,author,createdAt,reviewDecision --state open
 ```
-Pick the oldest awaiting review, or ask user.
+Pick the oldest awaiting review, or ask in a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)) with the open PRs as options, the oldest first.
 
 **Gate — PR State:** Run the [PR State Guard](../../references/common-operations.md#pr-state-guard) now, before reading the diff or touching Greenhouse. A closed or merged PR stops here — an explicitly-supplied PR number is exactly the path that reaches a non-open PR (the no-number path filters to `--state open`, so it can't). Skip this gate entirely in `--self` mode.
 
 **Gate — CI on the current head:** run [CI on the Current Head](../../references/common-operations.md#ci-on-the-current-head) — compare `headRefOid` with the latest completed run's `headSha` rather than trusting `gh pr checks`. A `CONFLICTING` PR or a SHA mismatch reports CI as **unverified** and becomes a blocking `[REQUIRED]` finding naming both SHAs and the run id — never "passing".
 
-Parse PR description for `Implements {TICKET-ID}`. If not found, offer three options:
+Parse PR description for `Implements {TICKET-ID}`. If not found, say *"This PR doesn't reference a Greenhouse ticket."* and ask in a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), header `PR #{number}`:
 
-> "This PR doesn't reference a Greenhouse ticket. Options:
-> 1. **Provide ticket ID** — if one already exists
-> 2. **Create ticket now** — I'll create one from the PR context
-> 3. **Skip** — proceed without ticket linkage (not recommended)"
+1. **Provide ticket ID** — if one already exists (typed in the free text)
+2. **Create ticket now** — I'll create one from the PR context
+3. **Skip** — go on without ticket linkage (not recommended)
 
 **Option 1:** User provides ticket ID → continue normally.
 
@@ -189,23 +188,20 @@ Batch escalation items and present before finalizing (see Step 3).
 
 ### 3a: Present escalation items (if any)
 
-If Step 2f identified findings needing human judgment, present them **before** finalizing the review:
+If Step 2f identified findings needing human judgment, present them **before** finalizing the review, each as a decision brief ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)):
 
 ```
-## Findings needing your input
+## {TICKET-ID} · {ticket title}: findings needing your input
 
-I found {N} items that need your call before I finalize the review:
+PR #{number} ({one line on what it does}) waits on these before its verdict.
 
 1. **{finding title}** ({file:line})
-   {description of the tradeoff or ambiguity}
-   → {option A} or {option B}?
-
-2. **{finding title}** ({file:line})
-   {description}
-   → {option A} or {option B}?
+   Decision: {the tradeoff or ambiguity}; why it's yours: {intent, design, scope}
+   {options against the checklist, one table; "Untouched by every option: …"}
+   Recommend {option}: {why}. {What would tip it.}
 ```
 
-Wait for user input. Classify each item based on their answer, then proceed to 3b.
+Then one box, one question per finding (up to 4; more go in a second box), header `{TICKET-ID}`, each question starting with the ticket key. Wait for the answers. Classify each item based on its answer, then go on to 3b.
 
 ### 3b: Present structured review
 
@@ -247,7 +243,9 @@ Wait for user input. Classify each item based on their answer, then proceed to 3
 - **Only `[NOTED]` findings (or none)** → approve.
 - **Any code `[REQUIRED]` finding** (bugs, logic, tests, security, unmet criteria, unverified CI) → request changes. No choice is offered.
 - **Every remaining `[REQUIRED]` is doc-like** — docs, code comments, copy, nothing that changes behavior → the reviewer chooses:
-  > "The {N} remaining required findings are all doc-like. Request changes, or approve with them as merge conditions?"
+  > "The {N} remaining required findings are all doc-like."
+
+  Then a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), header `{TICKET-ID}`: **Approve with merge conditions** (recommended: the author does them at merge) or **Request changes**.
 
   **Approve with merge conditions** posts an approval whose body carries the findings under a `## Merge conditions` heading, in the same `File:` / `Issue:` / `Fix:` shape. merge-pr reads that section back and asks the author to confirm each condition is done before merging. No structured tracking, no schema change.
 
@@ -257,11 +255,9 @@ Outside that one case the classification determines the verdict. The user's othe
 
 The verdict follows from the findings, but **posting it to GitHub + Greenhouse is gated on explicit user confirmation**. Do not call `gh pr review` or PATCH the ticket until the user gives a go-ahead in this exchange.
 
-Print the verdict line and ask:
+Print the verdict line, then a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): header `{TICKET-ID}`, question `{TICKET-ID}: post {APPROVE | APPROVE with {N} merge conditions | REQUEST_CHANGES} on PR #{number}?` ({N} required, {M} noted on the line above), options **Post it** (recommended) and **Walk me through a section first** (they name it in the free text).
 
-> "Ready to post **{APPROVE | APPROVE with {N} merge conditions | REQUEST_CHANGES}** for PR #{number} ({N} required, {M} noted). Post now, or walk through any section first?"
-
-Wait for a reply. Acceptable go-aheads: `post`, `ship it`, `yes`, `approve`, `request changes`, `lgtm`, or equivalent. Anything else — questions, "walk me through X", "let me think", silence — pauses posting. Address what was asked, then re-prompt with the same question.
+Only **Post it** (or an equivalent typed go-ahead: `post`, `ship it`, `yes`, `lgtm`) posts. Anything else — questions, "walk me through X", "let me think", a box that comes back unanswered — pauses posting. Address what was asked, then ask again in a fresh box.
 
 This gate applies whether the verdict is APPROVE or REQUEST_CHANGES. Never post a review verdict on the same turn it was drafted unless the user explicitly said to.
 

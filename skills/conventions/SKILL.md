@@ -210,15 +210,13 @@ A ticket/epic/project `status` PATCH **outside the scripted step of its matching
 | `fix-review-feedback` | `changes_requested` → `in_review` |
 | `release` | `harvest` → release-tagged variants |
 
-**Anything else requires the user to say so explicitly.** Rolling a ticket back to a previous state, jumping it forward without going through the skill, "tidying" a stuck ticket, or fixing what looks like a wrong status — all of these need a user go-ahead first. If a status looks wrong, surface it ("`{TICKET-ID}` is `in_review` but the PR is closed — should I move it to `weeded`?") and wait for an answer. Do not fix silently.
+**Anything else requires the user to say so explicitly.** Rolling a ticket back to a previous state, jumping it forward without going through the skill, "tidying" a stuck ticket, or fixing what looks like a wrong status — all of these need a user go-ahead first. If a status looks wrong, surface it ("`{TICKET-ID}` is `in_review` but the PR is closed.") and ask in a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)) — move it to `weeded`, or leave it — then wait for the answer. Do not fix silently.
 
 ---
 
 ## Capturing user corrections as durable rules
 
-When the user corrects a convention, assumption, scope decision, or workflow preference **that is likely to recur**, ask once before continuing:
-
-> "Should I persist this as a durable rule? Options: auto-memory (`feedback_*.md`), `plugin/references/engineering-conventions.md`, this project's `CLAUDE.md`, or skip."
+When the user corrects a convention, assumption, scope decision, or workflow preference **that is likely to recur**, ask once before continuing, in a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): question `Keep this as a durable rule?`, options auto-memory (`feedback_*.md`), `plugin/references/engineering-conventions.md`, this project's `CLAUDE.md`, or skip — the destination the table below points to first.
 
 This applies when the correction is general (version selection rules, test discipline, status hygiene, naming preferences, library choices) — not when it's a one-off context-specific fix (typos, this-PR-only choices, judgment calls that depend on the specific code being touched).
 
@@ -315,7 +313,7 @@ writes the code.
 |---|---|---|
 | None (a 1-row table) | `reviewer` stays null — the PR opens with no requested reviewer — and the skill warns: *"No reviewer candidate in the Team table — add a row (`/greenhouse:setup` prints yours)."* | no |
 | Exactly one (a 2-row table) | That row | no |
-| Several (3+ rows) | asked — the ticket's existing `reviewer` is offered as the default when it is among the candidates, then the other candidates, then "no reviewer". Never pick silently | yes |
+| Several (3+ rows) | asked in a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)) — the ticket's existing `reviewer` is offered as the default when it is among the candidates, then the other candidates, then "no reviewer". Never pick silently | yes |
 
 Rules at every size:
 - **Named in the session wins.** A reviewer — or "no reviewer" — the user already named ("jo reviews", "no reviewer on this one") is used as-is, with no question.

@@ -15,7 +15,7 @@ Autonomously address PR review comments: parse structured `[REQUIRED]`/`[NOTED]`
 
 When `--agent` is in the arguments (typed by the user, started by gh-dash or a ticket page, or fired by a `/loop` tick), run Step 0 (Preflight) as usual, then read [references/agent-fix.md](../../references/agent-fix.md) and follow it. It wins wherever this skill says otherwise. Without `--agent`, ignore that file and run as usual.
 
-- Agent mode takes one of your PRs with changes requested (the one named, or your oldest), settles every question up front, then fixes it in the ticket's own git worktree, alongside other chats on this machine, through gh-coord. `hold` pushes the fixes without re-requesting review.
+- Agent mode takes one of your PRs with changes requested (the one named, or your oldest) and fixes it in the ticket's own git worktree, alongside other chats on this machine, through gh-coord. It does what it can without you, then asks the rest in one box and waits. `hold` pushes the fixes without re-requesting review.
 - Never switch to agent mode on your own. A general request ("fix the review comments") is the normal skill below.
 - `GC` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord` and `DASH` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-dash`. The reference file uses these names: Claude Code fills in the plugin's path here, not in a file read later.
 
@@ -53,7 +53,7 @@ ${CLAUDE_PLUGIN_ROOT}/bin/gh-heartbeat
 
 **If no ticket ID:**
 - Auto-pick: `GET /rest/v1/tickets?project_id=eq.{id}&status=eq.changes_requested&select=display_id,title,pr_url&order=created_at.asc&limit=5`
-- If multiple → pick the oldest, or ask user
+- If multiple → pick the oldest, or ask in a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)) with them as options
 - If none → *"No tickets with changes requested. Nothing to fix."*
 
 Get the PR number from the ticket's `pr_url`.
@@ -86,7 +86,7 @@ The ticket context already carries the latest 5 comments (`get_ticket_context` r
 ## Step 3: Parse Findings
 
 - **Structured** (`[REQUIRED]`/`[NOTED]` tags from review-pr): Implement `[REQUIRED]` fixes directly using the `Fix:` instruction. Skip `[NOTED]`.
-- **Unstructured** (human prose): Ask user to classify each comment as `[REQUIRED]` or skip before implementing.
+- **Unstructured** (human prose): ask the user to classify each comment as `[REQUIRED]` or skip before implementing: one box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), one question per comment (up to 4; more go in a second box), the comment quoted above it, options **Required** and **Skip** with your recommendation first. A comment that picks between two behaviors is a decision brief.
 - **Mixed:** Handle structured directly, escalate unstructured to user.
 
 ---
@@ -182,17 +182,15 @@ Begin by listing capture candidates and asking once:
 
 > "Fixes are pushed. {N} `[REQUIRED]` findings are candidates for this repo's `.claude/review-patterns.md`:
 > - {finding title 1}
-> - {finding title 2}
->
-> Walk capture for all, pick which to capture, or skip?"
+> - {finding title 2}"
 
-Default on no reply or ambiguous reply: **skip**. Proceed to Step 9. Do not run capture without an explicit go-ahead in this exchange.
+Then a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): header `{TICKET-ID}`, question `{TICKET-ID}: capture review patterns from this round?`, options **Skip** (recommended), **Capture all**, and **Pick which** (named in the free text).
 
-Acceptable go-aheads: `walk all`, `capture`, `do it`, naming specific findings, or `yes`. Anything else (silence, `not now`, `skip`, `later`) → skip and continue.
+Do not run capture without an explicit go-ahead in this exchange: **Capture all**, **Pick which**, or a typed `walk all`, `capture`, `do it`, `yes`. **Skip**, `not now` or `later` → skip and go on to Step 9. A box that comes back unanswered is asked again, never read as either.
 
 For each finding the user opted in for:
 
-1. Ask: "Could a pre-PR checklist item have prevented this?" If no → skip
+1. Decide: could a pre-PR checklist item have prevented this? If no → skip
 2. Check both layers for an existing entry that covers this pattern: [references/review-patterns.md](../../references/review-patterns.md) (the plugin's shared baseline) and the current repo's `.claude/review-patterns.md`
 3. If no existing entry covers it, append a new pattern entry to the **current repo's** `.claude/review-patterns.md` — never to the plugin copy, which outside the greenhouse repo is the installed plugin cache (edits there are never committed and vanish on refresh). On first capture, create the file with the plugin file's header line and entry template (the commented block under `## Patterns`), then append:
 

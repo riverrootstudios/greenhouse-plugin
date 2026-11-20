@@ -44,6 +44,16 @@ check "a second claim under a different label returns TAKEN" '[ $rc -eq 1 ] && [
 out=$(gc claim TST-1 TST-1/work "$ROOT/wt1"); rc=$?
 check "the same label re-claims as already mine" '[ $rc -eq 0 ] && [[ "$out" == *"already mine"* ]]' "rc=$rc out=$out"
 
+# ── paths (GH-134: worktrees under .claude/worktrees) ──────────────────────
+main=$(gc config | sed -n 's/^MAIN=//p')   # git's real path ($ROOT can sit behind a symlink)
+out=$(gc paths TST-21); gc paths TST-21 >/dev/null
+check "paths puts a ticket's worktree under .claude/worktrees and keeps the folder out of git status" \
+  '[[ "$out" == *"WT=$main/.claude/worktrees/tst-21" ]] && [ "$(grep -cx "/.claude/worktrees/" "$REPO/.git/info/exclude")" = 1 ]' \
+  "$out | $(grep -v "^#" "$REPO/.git/info/exclude" 2>/dev/null)"
+mkdir -p "$main-22" && echo "gitdir: $main/.git/worktrees/repo-22" >"$main-22/.git"
+out=$(gc paths TST-22)
+check "paths keeps a ticket's existing worktree beside the main checkout" '[[ "$out" == *"WT=$main-22" ]]' "$out"
+
 # ── working (GH-133: tend-ticket's pill) ───────────────────────────────────
 tend() { (cd "$REPO" && CLAUDE_CODE_SESSION_ID=s-tend "$COORD" "$@"); }
 tend working TST-20 tend >/dev/null
@@ -132,6 +142,53 @@ echo "#   seen for an unmarked chat took $per ms per call"
 check "seen for a chat with no marker returns at once and touches nothing" \
   '[ $rc -eq 0 ] && [ $per -lt 100 ] && [ ! -e "$GREENHOUSE_AGENTS_DIR/chats/s-other" ]' "rc=$rc $per ms"
 
+# ── GH-134: an AskUserQuestion box drives the waiting flag ──────────────────
+(cd "$REPO" && CLAUDE_CODE_SESSION_ID=s-box "$COORD" claim TST-14 TST-14/review - >/dev/null)
+rec="$GREENHOUSE_AGENTS_DIR/chats/s-box"
+hook='{"session_id":"s-box","cwd":"'"$REPO"'","hook_event_name":"PreToolUse","tool_name":"AskUserQuestion"}'
+printf '%s' "$hook" | "$COORD" needs-you question
+first=$(sed -n 's/^needs_at=//p' "$rec")
+sleep 1
+printf '{"session_id":"s-box","cwd":"%s","hook_event_name":"Notification"}' "$REPO" | "$COORD" needs-you idle_prompt
+check "needs-you question then idle_prompt keeps question and the first needs_at" \
+  'grep -q "^needs=question$" "$rec" && [ -n "$first" ] && [ "$(sed -n "s/^needs_at=//p" "$rec")" = "$first" ]' "first=$first $(cat "$rec")"
+
+printf '{"session_id":"s-box","hook_event_name":"PostToolUse","tool_name":"Bash"}' | "$COORD" seen
+held=$(grep -c "^needs=question$" "$rec"); marker=$([ -e "$GREENHOUSE_MARKERS_DIR/needs/s-box" ] && echo yes || echo no)
+printf '{"session_id":"s-box","hook_event_name":"PostToolUse","tool_name":"AskUserQuestion"}' | "$COORD" seen box
+check "generic seen doesn't clear a box's question, the AskUserQuestion PostToolUse does" \
+  '[ "$held" = 1 ] && [ "$marker" = yes ] && ! grep -q "^needs" "$rec" && [ ! -e "$GREENHOUSE_MARKERS_DIR/needs/s-box" ]' \
+  "held=$held marker=$marker $(cat "$rec")"
+
+printf '%s' "$hook" | "$COORD" needs-you question
+printf '{"session_id":"s-box","hook_event_name":"UserPromptSubmit"}' | "$COORD" seen prompt
+check "UserPromptSubmit seen clears question" '! grep -q "^needs" "$rec" && [ ! -e "$GREENHOUSE_MARKERS_DIR/needs/s-box" ]' "$(cat "$rec")"
+
+# ── GH-134: a /loop tick stamps when it ran and when the next is due ────────
+loop() { (cd "$REPO" && CLAUDE_CODE_SESSION_ID="$1" "$COORD" tick ${2:+"$2"}); }
+due_gap() { echo $(( $(sed -n 's/^tick_due=//p' "$1") - $(sed -n 's/^tick_at=//p' "$1") )); }
+loop s-tick 7 >/dev/null
+rec="$GREENHOUSE_AGENTS_DIR/chats/s-tick"
+check "tick stamps tick_at and tick_due from the given minutes" \
+  'grep -q "^tick_at=[0-9]*$" "$rec" && [ "$(due_gap "$rec")" -eq 420 ]' "$(cat "$rec")"
+
+loop s-tick2 5 >/dev/null
+rec="$GREENHOUSE_AGENTS_DIR/chats/s-tick2"
+# The previous tick ended 10 minutes ago; this one starts now.
+sed -i.bak "s/^tick_at=.*/tick_at=$(( $(date +%s) - 600 ))/" "$rec" && rm -f "$rec.bak"
+before=$(date +%s)
+loop s-tick2 >/dev/null
+check "tick without minutes stamps tick_at and clears tick_due (a running tick has no due time)" \
+  '[ "$(sed -n "s/^tick_at=//p" "$rec")" -ge "$before" ] && ! grep -q "^tick_due=" "$rec"' "$(cat "$rec")"
+out=$(loop s-tick3 0 2>&1); rc=$?
+check "tick refuses a zero or non-numeric interval" '[ $rc -eq 64 ]' "rc=$rc out=$out"
+
+# ── gh-dash without node (GH-134) ──────────────────────────────────────────
+mkdir -p "$ROOT/nonode"
+out=$(cd "$REPO" && PATH="$ROOT/nonode" "$DASH" --report-preview 2>&1); rc=$?
+check "gh-dash with no node on the PATH says so plainly and exits 127" \
+  '[ $rc -eq 127 ] && [[ "$out" == "gh-dash: Node.js (18 or later) isn'"'"'t on the PATH"* ]]' "rc=$rc out=$out"
+
 # ── gh-dash report payload ─────────────────────────────────────────────────
 # Two chats gh-dash started three minutes ago: one never got going, one has called gh-coord since.
 old=$(( $(date +%s) - 180 ))
@@ -145,7 +202,20 @@ if command -v node >/dev/null 2>&1 && [ -x "$DASH" ]; then
   printf 'label=TST-12/work\npath=%s\nsince=x\nchat=s-gone\n' "$REPO" >"$GREENHOUSE_AGENTS_DIR/claims/TST-12/owner"
   printf 'since=x\nticket=TST-12\nrole=work\nlabel=TST-12/work\npath=%s\ndoing=db: pnpm test:db\n' "$REPO" >"$GREENHOUSE_AGENTS_DIR/chats/s-gone"
   node -e 'const t = Date.now() / 1000 - 7200; require("fs").utimesSync(process.argv[1], t, t)' "$GREENHOUSE_AGENTS_DIR/chats/s-gone"
+  # A review loop waiting on its box, which ticked two minutes ago and is due again in three.
+  t=$(date +%s)
+  printf 'since=x\nticket=TST-15\nrole=review\nlabel=TST-15/review\npath=%s\nneeds=question\nneeds_at=%s\ntick_at=%s\ntick_due=%s\n' \
+    "$REPO" "$((t - 60))" "$((t - 120))" "$((t + 180))" >"$GREENHOUSE_AGENTS_DIR/chats/s-wait"
   payload=$(cd "$REPO" && GREENHOUSE_MACHINE=test-box "$DASH" --report-preview 2>/dev/null)
+  check "report preview carries needs_since, last_tick_at and tick_due_at" \
+    'printf "%s" "$payload" | node -e '"'"'
+      const t = Number(process.argv[1]);
+      const chats = JSON.parse(require("fs").readFileSync(0, "utf8")).p_chats;
+      const c = chats.find((x) => x.session_id === "s-wait");
+      const plain = chats.find((x) => x.session_id === "s-going");
+      const at = (s) => (s ? Date.parse(s) / 1000 : NaN);
+      process.exit(c && c.needs_you === "question" && at(c.needs_since) === t - 60 && at(c.last_tick_at) === t - 120
+        && at(c.tick_due_at) === t + 180 && plain && plain.needs_since === null && plain.last_tick_at === null ? 0 : 1);'"'"' "$t"' "$payload"
   check "the machine snapshot is its slots and their commands, with no gauges, busy/idle or process list" \
     'printf "%s" "$payload" | node -e '"'"'
       const p = JSON.parse(require("fs").readFileSync(0, "utf8"));
@@ -181,7 +251,7 @@ if command -v node >/dev/null 2>&1 && [ -x "$DASH" ]; then
   # A copy of bin/ with a stand-in gh-jwt, a stand-in claude on PATH (background mode, so nothing
   # opens a window), and a Greenhouse that fails every report and has two starts queued.
   FAKE="$ROOT/fake"; mkdir -p "$FAKE/bin" "$FAKE/path"
-  cp "$COORD" "$DASH" "$FAKE/bin/"
+  cp "$COORD" "$DASH" "$HERE/../bin/gh-api" "$FAKE/bin/"
   printf '#!/bin/sh\ncase "$1" in agents) echo "[]" ;; --bg) echo "backgrounded · 0123abcd" ;; esac\n' >"$FAKE/path/claude"
   # ps feeds only the page's process list, so each call it logs is a page-only reading.
   printf '#!/bin/sh\necho ps >>"%s"\n' "$FAKE/ps-calls" >"$FAKE/path/ps"
@@ -190,11 +260,16 @@ if command -v node >/dev/null 2>&1 && [ -x "$DASH" ]; then
     const http = require("http"), fs = require("fs");
     let queued = 2;
     http.createServer((req, res) => {
-      req.resume();
+      let sent = "";
+      req.on("data", (c) => { sent += c; });
       req.on("end", () => {
         const fn = req.url.split("/").pop();
         fs.appendFileSync(process.argv[1], fn + "\n");
         const reply = (code, body) => { res.writeHead(code, { "content-type": "application/json" }); res.end(body); };
+        // gh-api checks: echo what arrived, or fail.
+        if (fn.startsWith("echo")) return reply(200, JSON.stringify({ method: req.method, apikey: req.headers.apikey,
+          auth: req.headers.authorization, prefer: req.headers.prefer || null, body: sent }));
+        if (fn.startsWith("fail")) return reply(400, "{\"message\":\"nope\"}");
         if (fn === "report_agent_state") return reply(500, "{\"message\":\"boom\"}");
         if (fn === "take_agent_start") return reply(200, JSON.stringify(queued-- > 0 ? [{ id: "r" + queued, kind: "review", ticket_number: 40 + queued }] : []));
         reply(204, "");
@@ -217,7 +292,16 @@ if command -v node >/dev/null 2>&1 && [ -x "$DASH" ]; then
   curl -s -o /dev/null "http://127.0.0.1:$(cat "$GREENHOUSE_AGENTS_DIR/dash.port")/api/state"
   sleep 1
   page_ps=$(cat "$FAKE/ps-calls" 2>/dev/null | wc -l | tr -d ' ')
+  api=$("$FAKE/bin/gh-api" PATCH '/rest/v1/echo?display_id=eq.TST-1' '{"status":"in_review"}'); api_rc=$?
+  api_err=$("$FAKE/bin/gh-api" GET /rest/v1/fail 2>&1 >/dev/null); api_err_rc=$?
   kill "$dash" "$fake" 2>/dev/null; wait "$dash" "$fake" 2>/dev/null
+  check "gh-api sends the session headers and the payload, and asks for the written rows back" \
+    '[ $api_rc -eq 0 ] && printf "%s" "$api" | node -e '"'"'
+      const r = JSON.parse(require("fs").readFileSync(0, "utf8"));
+      process.exit(r.method === "PATCH" && r.apikey === "pk" && r.auth === "Bearer jwt" && r.prefer === "return=representation"
+        && r.body === "{\"status\":\"in_review\"}" ? 0 : 1);'"'"'' "rc=$api_rc $api"
+  check "gh-api exits 1 on an HTTP error and prints the status and body on stderr" \
+    '[ $api_err_rc -eq 1 ] && [[ "$api_err" == *"HTTP 400"* && "$api_err" == *nope* ]]' "rc=$api_err_rc $api_err"
   reports=$(printf '%s\n' "$calls" | grep -c '^report_agent_state$')
   takes=$(printf '%s\n' "$calls" | grep -c '^take_agent_start$')
   finishes=$(printf '%s\n' "$calls" | grep -c '^finish_agent_start$')

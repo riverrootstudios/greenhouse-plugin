@@ -75,8 +75,7 @@ ${CLAUDE_PLUGIN_ROOT}/bin/gh-heartbeat
    - Breaking changes flagged → major bump
    - If no previous tag → `v0.1.0`
 
-Present proposed version for confirmation:
-> "Based on changes since {last-tag}, proposing {version} ({type} release). OK?"
+Present the proposed version as a confirm ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): one context line — *"Based on changes since {last-tag}, proposing {version} ({type} release)."* — then a box: header `Release`, question `Release: cut {version}?`, options **{version}** (recommended) and the next-larger bump, with a version of their own in the free text.
 
 ---
 
@@ -116,7 +115,9 @@ Before proceeding, verify:
 
 ### All Tickets Have Merged PRs
 For each harvest ticket without a pr_url → flag:
-> "Ticket {ID} is harvest but has no PR linked. Include in release anyway?"
+> "Ticket {ID} is harvest but has no PR linked."
+
+Then a confirm box: **Include it** or **Leave it out** (recommended when no commit names it).
 
 ### CI is Passing
 ```bash
@@ -206,9 +207,9 @@ Show the release notes and ticket list, then list what the next step will fire a
 - `tag-only` — workflows triggered by pushing a tag (`push: tags`) and by publishing a release (`release:`)
 - `promotion-pr` — workflows triggered by a `pull_request` into `main` (fire when the PR opens) and by a `push` to `main` (fire when a human merges it — e.g. a migrate job that applies migrations to production)
 
-> "Releasing {version} with {N} tickets. {Tagging | Opening the promotion PR} will fire: {workflow — job, per line | nothing}. {promotion-pr: Merging it will then fire: {…}.} OK to go ahead?"
+> "Releasing {version} with {N} tickets. {Tagging | Opening the promotion PR} will fire: {workflow — job, per line | nothing}. {promotion-pr: Merging it will then fire: {…}.}"
 
-One yes covers the tag or the PR. Anything else pauses.
+Then one confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), the notes staying visible above it: header `Release`, question `Release: {tag | open the promotion PR for} {version}?`, options **Go ahead** (recommended) and **Not yet**. One yes covers the tag or the PR. Anything else pauses.
 
 ---
 

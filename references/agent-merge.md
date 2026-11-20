@@ -18,17 +18,20 @@ Run under `/loop` (`/loop 5m /greenhouse:merge-pr --agent`, or `/loop /greenhous
 
 ## 1. Find candidates
 
+0. Under `/loop`, the tick's first command is `GC tick` and its last is `GC tick <minutes to the next tick>` ([parallel-agents §9](parallel-agents.md#9-under-loop)). A one-shot run skips both.
 1. `DASH --detach`, then `eval "$(GC greenhouse-env)"`: `ME=$GREENHOUSE_TEAM_USERNAME`, `KEY=$GREENHOUSE_PROJECT_KEY`, `GH_ME=$(gh api user --jq .login)`. Then `GC status` and `GC config`.
 2. `gh pr list --author @me --state open --json number,title,headRefName,baseRefName,reviewDecision,isDraft,labels,mergeStateStatus,headRefOid,body`. Keep the PRs that are `APPROVED`, not a draft, without a `hold` label, and based on `$BASE` or `epic/*`. A ticket or PR in the arguments narrows this to that one.
 3. Resolve the ticket from `Implements $KEY-{n}` in the body. It must be `assignee=$ME` and not `harvest` or `weeded`. Drop any ticket claimed in `GC status` under a label other than `$KEY-{n}/merge` (a work or fix chat has it).
 4. Nothing left → one line ("nothing approved") and end the tick.
-5. Order: this chat's in-flight claim first, then a PR that's CLEAN with CI green on its head (merge it now), then the oldest approval. **One PR in flight at a time.** Don't rebase a second PR while one waits on CI; the merge would make it BEHIND again. Parked PRs don't block the line.
+5. Order: this chat's in-flight claim first, then a PR that's CLEAN with CI green on its head (merge it now), then the oldest approval. **One PR in flight at a time.** Don't rebase a second PR while one waits on CI; the merge would make it BEHIND again. Parked PRs (waiting on someone else) and PRs with a question for the user don't block the line.
+
+**Person-free work first, then one box.** A tick merges, rebases and applies everything it can without a person before it asks anything. Each question it meets along the way (§2c, §3) is collected, not asked on the spot. At the end of the tick, all of them go in one box (§5), and the tick waits for the answer.
 
 ## 2. Gate each candidate (read-only)
 
-Read the ticket's latest `gh-loop merge` comment (§4) if there is one. It holds what earlier ticks recorded: the approved sha, the sha agent mode pushed, the head a rerun was spent on, and any parked question.
+Read the ticket's latest `gh-loop merge` comment (§4) and the comments after it. They hold what earlier ticks recorded: the approved sha, the sha agent mode pushed, the head a rerun was spent on, what this PR is parked on, and any answer the user gave (another chat may have recorded a different one).
 
-**a. The approval covers the head.** Take the latest approving review's `commit.oid` (`gh pr view <n> --json reviews,headRefOid`). The head must equal it, or equal the last sha agent mode pushed. Otherwise `git -C "$MAIN" fetch origin` and `git range-diff` from the approved commit to the head. It may show only a rebase (patches unchanged) plus agent mode's own commits. Anything else → park: "head changed after approval, needs re-review".
+**a. The approval covers the head.** Take the latest approving review's `commit.oid` (`gh pr view <n> --json reviews,headRefOid`). The head must equal it, or equal the last sha agent mode pushed. Otherwise `git -C "$MAIN" fetch origin` and `git range-diff` from the approved commit to the head. It may show only a rebase (patches unchanged) plus agent mode's own commits. Anything else → park: "head changed after approval, needs re-review". Parking is only for waits on someone else (here, the reviewer): the PR waits in Greenhouse with `parked=yes`, no question is asked, and later ticks check it again.
 
 **b. Collect the conditions.**
 - The approving review's `## Merge conditions` section.
@@ -39,13 +42,13 @@ Read the ticket's latest `gh-loop merge` comment (§4) if there is one. It holds
 - *Do here, no question:* wording in a file (code comments, docs), the PR title or body, the ticket's title, description or acceptance-criteria text, ticks, "green on the head", "rebase after #X lands", a migration renumber, rebase fallout, and **any code or test change the review spells out** (what to change and where).
 - *"File a ticket" for a fix the review already spells out, that fits in a few files:* fold it in here, and note in the PR body that it was folded in at merge.
 - *Ask (only these):* a condition that picks between two behaviors or designs the review left open, a fold-in too big to do safely at merge (say what it touches), or anything that needs a person, production, a dashboard, secrets or a device. A walk is never a merge condition; it's owed after merge.
-- Ask in one batched message per PR, with a recommendation for each item. The recommended option is "do it here, keep the approval, merge on every CI job green"; filing is the alternative. Record the PR as parked (§4). Later ticks print one line (`$KEY-{n}: still waiting on your answer above`) and keep working other PRs. Before acting on a parked PR, re-read the ticket's latest Greenhouse comments and status: another chat may have recorded a different answer.
+- Collect each ask item for the end-of-tick box (§5), as a decision brief ([common-operations §Asking the User](common-operations.md#asking-the-user)). The recommended option is "do it here, keep the approval, merge on every CI job green"; filing is the alternative. Then go on to the next PR. Before acting on a PR, re-read the ticket's latest Greenhouse comments and status: another chat may have recorded an answer.
 - When the user answers:
   - **Do it here / fold it in** → §3 in this chat. The ticket stays `in_review`.
   - **File it** → `/greenhouse:create-ticket`, then link the ticket in the PR body.
   - **Done** (the user ran the production check, looked at the dashboard, and so on) → mark it met.
 
-**d. CI on the head, every job.** Run [common-operations §CI on the Current Head](common-operations.md#ci-on-the-current-head), then `gh run view <id> --json jobs`. Every job must be `success`, not only the required ones. Pending → wait for a later tick. On a failure, run `gh run rerun <id> --failed` once per head sha and record that the rerun was spent. A second failure on the same head → park, name the failing test, and propose a flake ticket. Don't create it.
+**d. CI on the head, every job.** Run [common-operations §CI on the Current Head](common-operations.md#ci-on-the-current-head), then `gh run view <id> --json jobs`. Every job must be `success`, not only the required ones. Pending → wait for a later tick. On a failure, run `gh run rerun <id> --failed` once per head sha and record that the rerun was spent. A second failure on the same head → an ask item for §5: name the failing test, and offer filing a flake ticket (only on a yes) or leaving the PR until someone fixes it.
 
 **e. Freshness.** `mergeStateStatus` BEHIND or DIRTY → it needs a rebase (§3).
 
@@ -56,16 +59,16 @@ Read the ticket's latest `gh-loop merge` comment (§4) if there is one. It holds
 1. `eval "$(GC paths $KEY-{n})"`, then `GC claim $KEY-{n} $KEY-{n}/merge "$WT"`. `TAKEN` → skip it this tick.
 2. Worktree, per the protocol's §3:
    - `$WT` exists on the PR branch → it must be clean or hold only unpushed work you can account for, and not mid-rebase. Then `git pull --ff-only`. If the pull refuses, find out why. Don't reset.
-   - No worktree → `git -C "$MAIN" worktree add "$WT" <headRefName>`, then `GC worktree-setup "$WT"` and the install step there. The branch is checked out in `$MAIN` → park and ask.
+   - No worktree → `git -C "$MAIN" worktree add "$WT" <headRefName>`, then `GC worktree-setup "$WT"` and the install step there. The branch is checked out in `$MAIN` → an ask item for §5.
    - **Don't EnterWorktree.** This chat moves between tickets and removes worktrees after merge. Prefix every Bash command with `cd "$WT" &&`, use absolute `$WT` paths for Read and Edit, and check `pwd` and `git branch --show-current` before every commit.
-3. BEHIND or DIRTY → [Inline Rebase](common-operations.md#inline-rebase) onto `origin/<base>`. Resolve only mechanical conflicts: the lockfile (regenerate it), migration numbering, both sides adding imports or list entries. A conflict that chooses between two behaviors → `git rebase --abort`, park, ask.
-4. Migrations: if one of the PR's migrations is at or below the highest on `origin/<base>`, renumber it above `GC migration-floor` and fix references to the old name. If one replaces a function the base also changed since the branch point → park.
+3. BEHIND or DIRTY → [Inline Rebase](common-operations.md#inline-rebase) onto `origin/<base>`. Resolve only mechanical conflicts: the lockfile (regenerate it), migration numbering, both sides adding imports or list entries. A conflict that chooses between two behaviors → `git rebase --abort`, and it's an ask item for §5.
+4. Migrations: if one of the PR's migrations is at or below the highest on `origin/<base>`, renumber it above `GC migration-floor` and fix references to the old name. If one replaces a function the base also changed since the branch point → an ask item for §5.
 5. Apply the conditions: files, `gh pr edit` for the title and body, a Greenhouse PATCH for this ticket's fields.
 6. Local checks scale with the change:
    - Wording only, or a clean rebase: none. CI is the gate.
    - Other file changes (a resolved conflict, a code condition): the project's lint, plus typecheck through `GC heavy-run` when typed code changed. Run each new or changed test, and mutation-check it: break the line it guards, see it fail, restore. Regenerate any generated files the change needs (CLAUDE.md lists them) in the same commit.
    - A database-touching change (a migration renumber, a resolved conflict in migrations, policies, generated database files, or database tests): run the lock-free checks first. Then the protocol's §5 critical section under `$KEY-{n}/merge`: `db-acquire` (`db-wait` in the background if HELD), `db-stack`, reset to this branch, any generator the change needs, then the database tests (all of them after a renumber, the touched ones otherwise). `GC db-release $KEY-{n}/merge` right after, pass or fail.
-   - A check fails and the fix isn't mechanical → park and ask.
+   - A check fails and the fix isn't mechanical → an ask item for §5.
 7. Publish: join the chain with `&&`. Check the staged diff isn't empty, commit `chore: review r{N} merge conditions [$KEY-{n}]` (skip the commit after a rebase-only pass), then `git push` (`--force-with-lease` after a rebase; the approval survives it). Go on only once the push prints a new sha, and record that sha (§4). If conditions were applied:
    - post one PR comment that maps each condition to the sha, so the reviewer can see what changed after their approval;
    - add a line to the PR body, `Merge conditions applied at merge; CI is the gate.`, and put the same sentence in this tick's Greenhouse record comment (§4);
@@ -87,15 +90,21 @@ Then `GC unclaim $KEY-{n} $KEY-{n}/merge`, and go on to the next candidate in th
 **Record** each tick's progress on a PR in one Greenhouse comment on its ticket (comment pattern in [common-operations](common-operations.md#posting-comments-and-patching-multi-line-ticket-fields), `author` `${GREENHOUSE_TEAM_USERNAME}`): what this tick did, plus a marker the next tick reads.
 
 ```
-Loop merge: {rebased and pushed {short sha}, CI pending | conditions applied at {short sha} | parked: {question} | merged at {squash sha}; walk owed: {walk}}
+Loop merge: {rebased and pushed {short sha}, CI pending | conditions applied at {short sha} | parked: waiting on {who} to {what} | decided by {user}: {decision} → {answer}, because {reason} | merged at {squash sha}; walk owed: {walk}}
 
 [//]: # (gh-loop merge approved={sha} pushed={sha} rerun={sha or -} parked={yes|no})
 ```
 
-## 5. Tick summary
+`parked=yes` only while the PR waits on someone else (head changed after approval, needs re-review). A question for the user is never a park: it's asked in this tick's box.
 
-One line per PR: merged (squash sha), CI pending (run id, minutes so far), parked (why, and what answer is needed), or skipped (why). A quiet tick is one line.
+## 5. Ask, then the tick summary
 
-On any stop (a gate you can't pass, an error, a question): `git rebase --abort` if mid-rebase, `GC db-release $KEY-{n}/merge` if held, `GC unclaim $KEY-{n} $KEY-{n}/merge`, leave the worktree, and say exactly where it stands.
+**Ask.** With every PR's person-free work done, ask every ask item the tick collected in one box ([common-operations §Asking the User](common-operations.md#asking-the-user)), each a decision brief, header and question starting with the ticket key. A box holds up to 4 questions: with more, ask the 4 oldest and leave the rest for the next tick. Wait for the answer: the tick doesn't end, and no other tick fires, while the box is open. A box that comes back unanswered is asked again in a fresh box, never decided.
+
+With the answers in, record each in its ticket's §4 comment (and the PR body when it changes the PR) before doing anything else, so a chat that dies after the answer doesn't lose it. Then act on them (§2c's answers) in this tick, or leave the work for the next tick when CI has to run first.
+
+**Summary.** One line per PR: merged (squash sha), CI pending (run id, minutes so far), decided (the answer), parked (waiting on whom), or skipped (why). A quiet tick is one line.
+
+On any stop (a gate you can't pass, an error): `git rebase --abort` if mid-rebase, `GC db-release $KEY-{n}/merge` if held, `GC unclaim $KEY-{n} $KEY-{n}/merge`, leave the worktree, and say exactly where it stands.
 
 Under self-paced `/loop`: about 5 minutes while CI is pending, 20–30 minutes when nothing is approved.

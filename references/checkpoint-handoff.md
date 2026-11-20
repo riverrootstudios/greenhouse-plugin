@@ -45,8 +45,10 @@ Also emit one when:
 
 **Where to poke around:** {specific route, command, or page}
 
-**Next: Phase {N+1}** — {one line}. {Explicit yes/no ask}
+**Next: Phase {N+1}** — {one line}.
 ```
+
+Then the box (below).
 
 ### Section rules
 
@@ -76,7 +78,7 @@ If this section is empty, look harder. It is rarely genuinely empty. If it truly
 
 Never write "check the UI" or "verify it works." If a phase genuinely has nothing observable, say that outright — an honest "nothing to see here, it's verified by the pgTAP above" is more useful than a vague gesture.
 
-**Next** — name the next phase in one line and end with a real question. The user should be able to answer in one word.
+**Next** — name the next phase in one line. The handoff ends in a box ([common-operations §Asking the User](common-operations.md#asking-the-user)), not a question in prose: header `{TICKET-ID}`, question `{TICKET-ID}: Phase {N} done, go on to {short name of N+1}?`, and the next steps as options — **Go on to Phase {N+1}** (recommended when nothing above needs a decision), **Change something first** (they say what in the free text), and, when the handoff surfaced a decision, that decision as its own brief and question in the same box. The user answers with one tap.
 
 ---
 
@@ -98,6 +100,7 @@ If the plan changes mid-implementation, say so at the next handoff and restate t
 | Anti-pattern | Why it fails |
 |---|---|
 | "Phase 1 complete. Continue?" | Nothing to act on. This is the failure mode this reference exists to prevent |
+| A question at the end of a paragraph instead of a box | It's lost in scrollback and never reaches a phone |
 | Restating acceptance criteria as accomplishments | The user wrote them; echoing them proves nothing |
 | "All tests pass" | Give the count and the command. Unverifiable claims are worse than no claim |
 | "Check the UI to confirm" | Which page? Looking at what? |

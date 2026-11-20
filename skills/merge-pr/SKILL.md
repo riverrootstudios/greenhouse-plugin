@@ -47,7 +47,7 @@ ${CLAUDE_PLUGIN_ROOT}/bin/gh-heartbeat
 gh pr view {number} --json title,number,author,headRefName,baseRefName,reviewDecision,mergeable,body
 ```
 
-**If no PR number:** list your own open, approved PRs and pick, or ask.
+**If no PR number:** list your own open, approved PRs and pick, or ask in a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)) with them as options.
 
 Parse the PR body for `Implements {TICKET-ID}` and resolve via Resolve Ticket Context in [references/common-operations.md](../../references/common-operations.md).
 
@@ -101,17 +101,18 @@ Stop.
 
 The target branch is the PR's `baseRefName` (rung 2 of [Resolve Base Branch](../../references/common-operations.md#resolve-base-branch)) — whatever open-pr set, including an epic branch.
 
-With every gate passed, confirm:
+With every gate passed, confirm ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)). The context line:
 
-> "PR #{number} is approved and CI passed on the current head ({short-sha}). Squash merge into `{target-branch}` now?"
+> "PR #{number} is approved and CI passed on the current head ({short-sha})."
 
-With merge conditions, the same question lists them first:
+With merge conditions, it lists them first:
 
 > "PR #{number} is approved with {N} merge conditions:
-> 1. {condition} ({file})
-> Are these done? Yes squash-merges into `{target-branch}` now."
+> 1. {condition} ({file})"
 
-Wait for explicit go-ahead (`merge`, `yes`, `ship it`, `squash`, or equivalent). Anything else pauses.
+Then a box: header `{TICKET-ID}`, question `{TICKET-ID}: squash-merge PR #{number} into {target-branch}?` (with conditions: `{TICKET-ID}: conditions done, squash-merge PR #{number}?`), options **Merge it** (recommended) and **Not yet**. A merge condition that picks between two behaviors is a decision brief of its own, asked before this box.
+
+Wait for an explicit go-ahead (**Merge it**, or a typed `merge`, `yes`, `ship it`, `squash`). Anything else pauses, and a box that comes back unanswered is asked again.
 
 ```bash
 gh pr merge {number} --squash --subject "{type}: {description} [{ticket-id}]"

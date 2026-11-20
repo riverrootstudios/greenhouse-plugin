@@ -15,9 +15,9 @@ The most important skill for autonomous workflow — a well-tended ticket means 
 
 **Proportional to complexity.** Don't interrogate a 1–2pt ticket — a quick confirm is enough. Scale the questioning up with the score: 8pt+ tickets deserve genuine back-and-forth on scope, architecture, and infrastructure; 16pt+ almost always hide unstated requirements worth surfacing before any code is written.
 
-**One-shot escape hatch.** If the user says "just tend it" / "don't ask" / "autonomous," skip the interactive prompts, make reasonable choices, record assumptions in `open_decisions`, and present the result in one pass. The [Premise Check](#step-23-premise-check) still runs: take its recommended outcome and record it in `open_decisions`.
+**One-shot escape hatch.** If the user says "just tend it" / "don't ask" / "autonomous," skip the interactive prompts, make reasonable choices, record each assumption in `open_decisions` as `- [x] {question} → assumed {X}` (so it doesn't block work-ticket), and present the result in one pass. The [Premise Check](#step-23-premise-check) still runs: take its recommended outcome and record it in `open_decisions`.
 
-Route surfaced decisions into the ticket: firm choices become acceptance criteria; unresolved ones go to `open_decisions` so `work-ticket` inherits them.
+Every question this skill asks follows [common-operations §Asking the User](../../references/common-operations.md#asking-the-user): material decisions as decision briefs, the final confirm as a confirm. Route surfaced decisions into the ticket: firm choices become acceptance criteria; unresolved ones go to `open_decisions` as open lines ([open_decisions format](../../references/greenhouse-schema.md#open_decisions-format)) so `work-ticket` asks them before any code.
 
 When a tending session pauses mid-way (a long ticket, a decision the user needs to go check on), hand off using [references/checkpoint-handoff.md](../../references/checkpoint-handoff.md) — same format `work-ticket` uses between phases, so a pause reads the same wherever it happens: what's settled so far, what you should be aware of, what's still open, and the next ask.
 
@@ -60,16 +60,16 @@ ${CLAUDE_PLUGIN_ROOT}/bin/gh-heartbeat
 
 **If no ticket ID:**
 - Auto-pick untended: `GET /rest/v1/tickets?project_id=eq.{id}&tended=is.false&status=in.(sprouted,seeds)&order=priority.asc,created_at.asc&limit=1&select=display_id,title,status,priority`
-- Confirm with user: *"Next untended ticket is {display_id}: {title}. Tend this one?"*
+- Confirm in a box: header `{display_id}`, question `{display_id}: tend this one next?` (its title on the line above), options **Tend it** (recommended) and **Pick another**
 - Then resolve full context via common-operations
 
 **If not found:** *"No untended tickets in sprouted or seeds — want me to plan some new work?"*
 
 **Waiting on a decision:** check this before anything else. When the context's relations hold a `blocked_by` entry whose `related_status` isn't `harvest` or `weeded`, look up those tickets' types (`GET /rest/v1/tickets?id=in.({related_ticket_ids})&select=display_id,title,type`). If one is `no_code`, say so first and recommend waiting for that decision:
 
-> "{ID} is blocked by {decision ID}: {title}, a decision that hasn't been made. Tending now builds on a guess, so I'd wait for it. Tend anyway?"
+> "{ID} is blocked by {decision ID}: {title}, a decision that hasn't been made. Tending now builds on a guess, so I'd wait for it."
 
-Continue only on the user's say-so. A one-shot tend notes the wait in `open_decisions` and continues, since work-ticket's blocker check holds the work back anyway.
+Then a confirm box: **Wait for {decision ID}** (recommended) or **Tend anyway**. Continue only on the user's say-so. A one-shot tend notes the wait in `open_decisions` and continues, since work-ticket's blocker check holds the work back anyway.
 
 **Show that it's being tended:** once the ticket is settled, label this chat with it, so the ticket's tile shows the tend pill wherever gh-dash runs (GH-133):
 
@@ -111,7 +111,7 @@ Build the case from the ticket and these sources:
 - **Cheaper:** the lowest rung that might meet the need, and why it doesn't.
 - **Not building costs:** what the asker keeps doing if this never ships.
 
-End in one decision, asked as one question rather than a series:
+End in one decision, asked as one decision brief ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)) rather than a series. The block below is the brief's context; the option table (proceed / shrink / park / weed against the checklist) and the recommendation follow it, then one box with the four outcomes as options, the recommended one first:
 
 ```
 Premise: {ID} — {title} ({N}pt, rung {n})
@@ -121,9 +121,7 @@ Rung:       {n} · {the part that sets it}
 Cheaper:    {alternative} — not enough because {why}
 Not building costs: {…}
 
-Decision: build {ID} as scoped
-Options: proceed / shrink / park / weed
-Recommend: {one} — {one-line why}
+Decision: build {ID} as scoped?
 ```
 
 | Outcome | What happens |
@@ -154,9 +152,9 @@ Ask: {1–2 followup questions}
 
 ## Step 2.7: Elicit Requirements (Socratic)
 
-Before expanding criteria, draw out what the ticket *doesn't* say yet. Ask targeted questions — batch a focused handful, don't drip one at a time — aimed at the gaps most likely to bite. Skip questions the ticket or codebase already answers; only ask what genuinely changes the work.
+Before expanding criteria, draw out what the ticket *doesn't* say yet. Ask targeted questions — batch a focused handful in one box, don't drip one at a time — aimed at the gaps most likely to bite. Each question offers 2–4 likely answers, the one you'd pick first; the person types their own in the free text. Skip questions the ticket or codebase already answers; only ask what genuinely changes the work.
 
-**Start with any `open_decisions` already on the ticket,** such as a detail sow deferred, and put them before the lenses. Then run through these lenses, as relevant:
+**Start with the ticket's open `open_decisions` items** (`- [ ]` lines, such as a detail sow deferred; [open_decisions format](../../references/greenhouse-schema.md#open_decisions-format)). Ask each as a decision brief while the person is there, before the lenses, and write each answer back ticked: `- [x] {question} → {answer} ({who}, {date})`. Then run through these lenses, as relevant:
 
 - **Themes & fit** — what's the underlying theme, and how does this fit the product and existing patterns? Is it consistent with how the rest of the app already works, or introducing a new way of doing something?
 - **Simplicity** — state a position the user can refute, not an open question: *"a flag does this at 4pt; the column buys X — keep it only if X matters."* Draw on one or two of these questions, never all of them:
@@ -174,15 +172,9 @@ Before expanding criteria, draw out what the ticket *doesn't* say yet. Ask targe
 - **Non-functional needs** — performance/scale, security/privacy, observability.
 - **Done, precisely** — how will we know it works? What must a reviewer be able to verify?
 
-Present each material decision with a recommended default so the user can confirm fast:
+Present each material decision as a decision brief ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): the context, why it's the person's call, the options against the checklist in one table, and the recommendation with what would tip it, then the box. Several decisions go in one box, up to 4.
 
-```
-Decision: {the choice}
-Options: {A} / {B}
-Recommend: {A} — {one-line why}
-```
-
-Feed the answers into Step 3. Firm answers → acceptance criteria; open questions → `open_decisions`. For a one-shot tend (see Working Mode), skip the prompts, choose the recommended defaults, and list them under `open_decisions` as assumptions.
+Feed the answers into Step 3. Firm answers → acceptance criteria, and the decision ticked in `open_decisions`; questions the person wants to leave open → `- [ ] {question} — recommend {X}`. For a one-shot tend (see Working Mode), skip the prompts, choose the recommended defaults, and list them under `open_decisions` as assumptions (`- [x] {question} → assumed {X}`).
 
 ---
 
@@ -313,7 +305,7 @@ Show the complete expanded ticket for confirmation:
 - {TICKET-ID}: {reason}
 ```
 
-Iterate until approved.
+Then the final confirm ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), the ticket staying visible above it: header `{TICKET-ID}`, question `{TICKET-ID}: mark it tended?`, options **Mark it tended** (recommended) and **Change something** (they say what in the free text). Iterate until approved.
 
 ---
 
@@ -326,7 +318,7 @@ On approval:
    - `labels`: enriched with 2-5 labels based on implementation scope
    - `epic_id`: only when the user set one in this tending conversation
    - `complexity`: scored value (1-64)
-   - `open_decisions`: any unresolved questions surfaced during tending
+   - `open_decisions`: every decision surfaced during tending, one line each ([open_decisions format](../../references/greenhouse-schema.md#open_decisions-format)): settled ones ticked with who and when, assumptions ticked as assumed, and any the person left open as `- [ ]`
    - `summary`: refresh the one/two-sentence plain-English "what this delivers" if tending changed the scope (it's the Slack notification body — keep it non-technical)
    - `tended`: `true`
    - `updated_by`: `${GREENHOUSE_TEAM_USERNAME}`

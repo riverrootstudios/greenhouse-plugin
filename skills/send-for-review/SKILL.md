@@ -85,9 +85,9 @@ The reviewer must be a **Team-table member** (CLAUDE.md) with access to the tick
 
 This posts to Slack for any rule that includes Handed off. Always confirm, even when the user said to go ahead autonomously:
 
-> *"Send **{ID}** "{title}" to **{reviewer}** for review? It becomes their move on the board, and Slack rules that follow handoffs will post it."*
+> *"**{ID}** "{title}" goes to **{reviewer}** for review. It becomes their move on the board, and Slack rules that follow handoffs will post it."*
 
-Proceed only on a yes.
+Then a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): header `{ID}`, question `{ID}: send it to {reviewer} for review?`, options **Send it** (recommended) and **Not yet**. Go on only on a yes.
 
 ---
 

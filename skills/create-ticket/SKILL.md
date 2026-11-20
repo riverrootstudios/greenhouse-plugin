@@ -68,7 +68,7 @@ If no `--replan` flag, proceed with normal project identification below.
 Determine the target project:
 
 1. Check current git repo → read `project_id` from the `greenhouse` config block in CLAUDE.md
-2. If ambiguous or no repo context → ask which project
+2. If ambiguous or no repo context → ask which project, in a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)) with the likely projects as options
 3. Load project config (repo, tech stack, default branch)
 
 ---
@@ -143,7 +143,7 @@ When source documents were provided in Step 1, track them here — they go in ea
 
 ### Assignment Rules
 
-1. **Assignee** — a solo team (one Team-table row) assigns its one member, no question. Otherwise ask once who should own which tickets; "no preference" leaves them **unassigned** — `work-ticket` sets the assignee when someone picks the ticket up. Assignee values are Team-table **Greenhouse** usernames (`${GREENHOUSE_TEAM_USERNAME}` for yourself), never a name, initials or GitHub login
+1. **Assignee** — a solo team (one Team-table row) assigns its one member, no question. Otherwise ask once who should own which tickets, in one box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): one question per ticket (up to 4), or with more tickets one question for all of them. Each question's options are up to 3 Team rows (the likeliest owners first) and "no preference", since a box takes at most 4; another row, or a different owner per ticket, goes in the free text. "No preference" leaves them **unassigned** — `work-ticket` sets the assignee when someone picks the ticket up. Assignee values are Team-table **Greenhouse** usernames (`${GREENHOUSE_TEAM_USERNAME}` for yourself), never a name, initials or GitHub login
 2. **Reviewer** — shown per ticket in the Step 4 table, never a separate question. [conventions §Reviewer Rule](../conventions/SKILL.md#reviewer-rule) with each ticket's assignee as the implementer: pre-filled when the rule yields exactly one candidate, blank when it would ask — `open-pr` asks when the PR opens unless the user names one
 3. The user can change either in their Step 4 feedback; "unassigned" and "no reviewer" are valid answers
 
@@ -173,7 +173,9 @@ Show the full breakdown with implementation order BEFORE creating anything:
 ```
 
 Before asking for approval, present a combine check if breakdown has 2+ tickets:
-> "This breakdown has {N} tickets. Every ticket becomes a PR that a human must review — review coordination cost grows with each additional PR. AI handles large vertical slices well, so fewer bigger tickets is almost always better. Could any of these be combined? (More than 3 tickets for one feature is usually over-decomposing.)"
+> "This breakdown has {N} tickets. Every ticket becomes a PR that a human must review — review coordination cost grows with each additional PR. AI handles large vertical slices well, so fewer bigger tickets is almost always better. More than 3 tickets for one feature is usually over-decomposing."
+
+Then ask for approval in one confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), the breakdown staying visible above it: header `{KEY}`, question `{KEY}: create {N} ticket(s) for {feature}?`, options **Create them** (recommended), **Change something** (they say what in the free text), and, with 2+ tickets, **Combine them** (name which in the free text). The split question is the same box: with one ticket that a hard dependency would force apart, say so above the box and add a **Split it** option.
 
 Iterate until the user approves. Accept feedback to:
 - Combine tickets
@@ -306,11 +308,9 @@ Identify the recommended starting ticket (first unblocked, or highest priority i
 
 ## Step 10: Hand Off
 
-Ask:
-> "Want to start on a ticket now?"
+Ask in a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): header the recommended ticket's key, question `{ID}: start on it now?`, options **Tend it first** (recommended when it isn't tended), **Start it**, **Not now**.
 
-If yes:
-- Ticket needs tending → offer to tend it first: *"Want me to tend {ticket-id} before we start? That sets up better acceptance criteria and file targets."*
-- Ticket is tended (or user wants to proceed) → offer to start: *"Ready to start on {ticket-id}?"* and invoke the work-ticket skill
+- **Tend it first** → invoke the tend-ticket skill (it sets up better acceptance criteria and file targets).
+- **Start it** → invoke the work-ticket skill.
 
 Do NOT start implementation manually — always route through the work-ticket skill.

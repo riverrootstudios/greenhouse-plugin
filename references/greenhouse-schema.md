@@ -131,7 +131,7 @@ The core table. Everything revolves around this.
 | change_note | TEXT | no | — | One-line "what recently changed" display field; delivery text is frozen in `activity_log.value_was` at enqueue |
 | implementation_plan | TEXT | no | — | Plan before work |
 | implementation_notes | TEXT | no | — | Decisions during work |
-| open_decisions | TEXT | no | — | Unresolved questions |
+| open_decisions | TEXT | no | — | One checkbox line per decision; see [open_decisions format](#open_decisions-format) |
 | labels | TEXT[] | no | — | `'{frontend,auth,api}'` |
 | compliance_tags | TEXT[] | no | — | `'{soc2,iec_62304}'` |
 | branch_name | TEXT | no | — | Git branch |
@@ -148,6 +148,18 @@ The core table. Everything revolves around this.
 | updated_at | TIMESTAMPTZ | yes | now() | Auto-updated by trigger |
 
 All field changes are auto-logged to `activity_log` by a trigger.
+
+#### open_decisions format
+
+One item per line (GH-134). tend-ticket, sow-feedback and work-ticket write and read it this way:
+
+| Line | Meaning |
+|------|---------|
+| `- [ ] {question} — recommend {X}` | Open: a person still has to decide it |
+| `- [x] {question} → {answer} ({who}, {date})` | Settled by that person on that date |
+| `- [x] {question} → assumed {X}` | A one-shot tend's assumption: recorded, and it doesn't block |
+
+An open item blocks implementation: work-ticket asks each one as a [decision brief](common-operations.md#asking-the-user) before any code and writes the answer back ticked, and `work-ticket --agent`'s auto-pick skips the ticket. Text with no checkbox lines is legacy free text: work-ticket shows it and confirms it in one box first.
 
 ---
 

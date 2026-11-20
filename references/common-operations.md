@@ -178,10 +178,10 @@ For the ticket being worked on:
 
 1. Use the relations already in the ticket's `get_ticket_context` — if you already hold this ticket's context from the calling skill, reuse it; otherwise call `get_ticket_context` (not `get_ticket_relations`, which returns a subset of the same thing). Look for entries with `direction = 'blocked_by'` (their `relation_type` is `blocks`).
 2. A blocker whose `related_status` is `harvest` or `weeded` is **resolved** — it no longer blocks. Leave the relation in place: it records that the blocker once held this ticket up, and the web surfaces show it struck through (GH-104). Never delete a relation because its blocker finished.
-3. If any blocker is still open, list them with their statuses. Offer:
+3. If any blocker is still open, list them with their statuses, then ask as a [decision brief](#asking-the-user) with these options:
    1. Work on a blocker instead
-   2. Unlink a blocker that never applied (`DELETE /rest/v1/ticket_relations?id=eq.{relation_id}`) and proceed — only on the user's say-so
-   3. Proceed anyway (stacked branch off the blocker's branch, if applicable)
+   2. Unlink a blocker that never applied (`DELETE /rest/v1/ticket_relations?id=eq.{relation_id}`) and go on — only on the user's say-so
+   3. Go on anyway (stacked branch off the blocker's branch, if applicable)
 4. If every blocker is resolved (or there are none): proceed normally
 
 Alternatively, use the `blocked_tickets` view for a project-wide blocker overview:
@@ -244,9 +244,9 @@ Claude Code can create git worktrees on its own. Skills never do: a worktree is 
 
 **Detect one:** the cwd is a worktree when `git rev-parse --git-common-dir` and `git rev-parse --git-dir` differ. `git worktree list --porcelain` lists every worktree with its `branch`.
 
-**One local database per machine.** Every worktree shares the same local Supabase stack, but each carries only its own branch's migrations. Before `supabase db reset` or `supabase migration up` from a worktree, warn: *"This worktree has {branch}'s migrations only — resetting the shared local DB here drops anything the main checkout's branch added. Continue?"*
+**One local database per machine.** Every worktree shares the same local Supabase stack, but each carries only its own branch's migrations. Before `supabase db reset` or `supabase migration up` from a worktree, [confirm](#asking-the-user): *"This worktree has {branch}'s migrations only — resetting the shared local DB here drops anything the main checkout's branch added."* Then a box: reset anyway, or stop.
 
-**Removing one:** `git worktree remove {path}`. When `git -C {path} status --porcelain` is non-empty, confirm first, naming the path: *"{path} has uncommitted changes — remove it anyway?"* Never `--force` without that yes.
+**Removing one:** `git worktree remove {path}`. When `git -C {path} status --porcelain` is non-empty, [confirm](#asking-the-user) first, naming the path: *"{path} has uncommitted changes."* Then a box: keep it (recommended), or remove it anyway. Never `--force` without that yes.
 
 ---
 
@@ -268,6 +268,80 @@ A skill never files a ticket on its own. Work found outside the current acceptan
 4. Create a ticket (via [create-ticket](../skills/create-ticket/SKILL.md)) only after the user says yes to a specific item.
 
 An empty list is omitted, not printed as "none".
+
+---
+
+## Asking the User
+
+**Used by:** every skill, wherever it stops for a person's answer (GH-134, which absorbed GH-110). Each decision point links here instead of restating it.
+
+A question is prose above an `AskUserQuestion` box. The prose carries what's needed to decide; the box carries the decision. A question is never the last line of a paragraph, and no paragraph ends by asking whether to go on.
+
+### Two tiers
+
+| Tier | Asked for | Shape |
+|------|-----------|-------|
+| **Decision brief** | A choice between behaviors, designs or scope: a loop's judgment items, tend's material decisions, a merge condition that picks a behavior, an `open_decisions` item | The brief below, then the box |
+| **Confirm** | A gate over content already shown above it: the release version, tend's final confirm, sow-feedback's and create-ticket's batch confirms | One context line, then the box. A batch confirm keeps the full plan visible as prose above the box |
+
+### The decision brief
+
+The person answering is switching in from other work and can't rebuild the stakes from scrollback, so the brief stands alone:
+
+1. **Context:** the ticket key and title, a one-line description, and what is waiting on the answer (a PR, a merge, the rest of a tick).
+2. **The decision**, why a person must make it rather than the agent, and what it blocks.
+3. **The options compared in one table.** The rows are the checklist below and the columns are the options.
+4. **The recommendation**, and what would tip the decision the other way.
+
+The checklist, in this order: maintainability; scale and performance; security and privacy; production data (migrations, backfills, writes that can't be undone); shipped mobile builds and wire compatibility; compliance; cost; user-facing behavior and support load; reversibility.
+
+Rows where every option is "none" collapse into one line under the table, `Untouched by every option: {items}`. Every checklist item appears in the table or in that line.
+
+```
+GH-212 · Retry failed Slack sends: a notification that fails is retried with backoff.
+PR #301 is approved and its merge waits on this.
+
+Decision: the review left open whether a send that fails 5 times is dropped or kept for a person
+to resend. It changes what admins see when Slack is down, so it isn't the agent's call. It blocks the merge.
+
+|                                    | Drop after 5 (Recommended)    | Keep in a dead-letter table             |
+|------------------------------------|-------------------------------|-----------------------------------------|
+| Maintainability                    | none                          | a new table and its sweep               |
+| Production data                    | none                          | one additive migration                  |
+| User-facing behavior, support load | a lost send is logged only    | admins can resend; one more screen      |
+| Reversibility                      | easy                          | easy: the table is additive             |
+
+Untouched by every option: scale and performance, security and privacy, shipped mobile builds and wire compatibility, compliance, cost.
+
+Recommend dropping after 5: Slack outages are rare and the log already shows each loss. A customer who
+needs every notification delivered would tip it to the dead-letter table.
+```
+
+### The box
+
+Shaped for the phone: with Remote Control the box arrives as a push notification, and that line is all the person sees before they open it.
+
+- `header`: the ticket key (`GH-212`). With no ticket, the skill's subject (`Release`, `Sow`).
+- `question`: starts with the ticket key and names the decision in one line that reads on its own: `GH-212: drop or keep Slack sends that fail 5 times?`
+- `options`: 2–4, mutually exclusive. The recommended one comes first with "(Recommended)" at the end of its label. Each option's `description` is its one-line consequence.
+- A pick from a longer list (PRs, tickets, notes, Team rows) still takes at most 4 options: the likeliest 3, then **Another** (they type which in the free text), with the full list in the prose above the box.
+- `multiSelect` only when the choices genuinely combine.
+- Several questions at one stop go in one box, up to 4, each with its brief above it.
+
+**No question tool:** a numbered option list with the recommended option marked stands in, and the skill waits for a reply.
+
+### Unanswered is not an answer
+
+A box that comes back unanswered or cancelled is never a decision: the app moved on after `askUserQuestionTimeout`, a remote dialog lapsed after `dialogExpiry`, or the reply says nobody answered. Ask again in a fresh box. Never fall back to the recommendation.
+
+### What gets asked
+
+- Agents ask only what needs a person. They decide everything else and record the reasoning in the PR body, or in the ticket's `implementation_notes` when there's no PR yet.
+- A stop a skill calls mandatory stays mandatory, autonomous or not.
+
+### After the answer
+
+Record the decision and its reason where teammates and later chats can see it: the ticket's round comment (the skill's own comment for that step), and the PR body when the answer changes the PR. A loop records it before its tick ends, so a chat that dies after the answer doesn't lose it.
 
 ---
 
@@ -321,15 +395,17 @@ Then end the skill. The user asked to act on a PR that is no longer actionable; 
 
 Draft PRs are reviewable, but the author may not be ready:
 
-> "PR #{number} is still a draft. Review it anyway?"
+> "PR #{number} is still a draft: its author may not be ready."
 
-Proceed on confirmation; stop otherwise.
+Then a [confirm](#asking-the-user) box: review it anyway, or stop. Go on only on that yes.
 
 ### Ticket status cross-check
 
 When the PR is open but the linked ticket is already `harvest`, the two have drifted:
 
-> "PR #{number} is open, but {TICKET-ID} is already `harvest` in Greenhouse. That usually means the ticket was harvested against a different PR. Worth checking before I continue — proceed anyway?"
+> "PR #{number} is open, but {TICKET-ID} is already `harvest` in Greenhouse. That usually means the ticket was harvested against a different PR."
+
+Then a [confirm](#asking-the-user) box: stop and check (recommended), or go on anyway.
 
 ---
 

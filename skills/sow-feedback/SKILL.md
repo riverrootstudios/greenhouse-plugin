@@ -48,7 +48,7 @@ Planted:
   [2] "{...}" — sown by {triaged_by list} → {display_ids}
 ```
 
-A Planted note can be sown again (a second pass tallies a new triage row). Confirm the selection.
+A Planted note can be sown again (a second pass tallies a new triage row). Ask which note to sow in a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user), a confirm over the list above): the notes as options, the oldest Raw one first and recommended. Past 4 notes, offer the 3 oldest Raw ones plus "another (type its number)".
 
 ---
 
@@ -104,7 +104,7 @@ Show the list to the user before triaging. This list is the coverage guarantee: 
 
 ## Step 2.5: Steer Unsettled Candidates
 
-Skip this step when no candidate is *unsettled*. Otherwise, pause after the list and ask **once, batched**, quoting each unsettled exchange (2–4 lines, with speaker and timestamp when present) and saying exactly what's open:
+Skip this step when no candidate is *unsettled*. Otherwise, pause after the list and ask **once**, in one box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), quoting each unsettled exchange above it (2–4 lines, with speaker and timestamp when present) and saying exactly what's open. Each unsettled candidate is one question in the box (up to 4; more go in a second box), its options the steers in the table below, the recommended one first:
 
 ```
 These weren't settled in the discussion:
@@ -113,11 +113,10 @@ R4 {short name}
    > {speaker} ({timestamp}): {line}
    > {speaker} ({timestamp}): {line}
    Open: {exactly what was left undecided}
-   → Open question{ · or note it in {display_id} — when recommended}
-
-Steer each (e.g. "R4 Open question, R7 note it in {display_id}, R9 settle: {decision}").
-Anything not named stays an Open question.
+   → recommend: Open question{ | note it in {display_id}}
 ```
+
+The box's question for each is `R{n} {short name}: how to steer it?`. **Settle it now** takes the decision as the answer's free text ("Other"). A box that comes back unanswered is asked again, never read as Open question.
 
 | Steer | What happens |
 |-------|--------------|
@@ -221,10 +220,9 @@ About to:
   • UPDATE {display_id} — add AC: {one-liner}
   • UPDATE {display_id} — open_decisions: {the unsettled point}{ · blocks {...}}
   • DROP   R{n} — {requirement} ({Word}: {reason})
-Proceed?
 ```
 
-The rung, the cheaper alternative and the customer link are approved in this same confirm. They add no new question. Wait for approval. Iterate on feedback.
+Then one confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), the plan staying visible above it: header `Sow`, question `Sow "{note title}": write this batch?`, options **Write it** (recommended) and **Change something** (the person says what, and the batch is shown again). The rung, the cheaper alternative and the customer link are approved in this same confirm. They add no new question. Wait for approval. Iterate on feedback.
 
 ---
 
@@ -253,7 +251,7 @@ The description **starts** with these lines, each its own paragraph, so the orig
 | **Promised** | The candidate is *promised* |
 | **Earlier asks** | The earlier-drops check matched this candidate |
 
-A *partly settled* create gets the deferred detail in `open_decisions`. `create_ticket` has no parameter for it, so PATCH it right after the create with the `--rawfile` pattern.
+A *partly settled* create gets the deferred detail in `open_decisions`, one open line per point in the [open_decisions format](../../references/greenhouse-schema.md#open_decisions-format): `- [ ] {question} — recommend {X}`. `create_ticket` has no parameter for it, so PATCH it right after the create with the `--rawfile` pattern.
 
 **Updates** — for each existing ticket:
 
@@ -268,7 +266,7 @@ A *partly settled* create gets the deferred detail in `open_decisions`. `create_
 
 **Decision tickets** — for each candidate the user steered into a no_code ticket in Step 2.5:
 
-1. Create the `no_code` "Decide …" ticket like any other create. For an existing one, append the open point to its `open_decisions` as an Update: the same PATCH, `change_note` and notification as above, with `open_decisions` in place of `acceptance_criteria`.
+1. Create the `no_code` "Decide …" ticket like any other create. For an existing one, append the open point to its `open_decisions` as one open line (`- [ ] {question} — recommend {X}`) in an Update: the same PATCH, `change_note` and notification as above, with `open_decisions` in place of `acceptance_criteria`.
 2. Add a `blocks` relation from the decision ticket to each build ticket that depends on it, whether created in this run or already open (`POST /rest/v1/ticket_relations` with `source_ticket_id` = the decision ticket, as in [status-flows §Blocks](../../references/status-flows.md#blocks--blocked-by-relations-table)). Skip a pair that is already related.
 
 **Customer** — when Step 4 named a customer and the note isn't linked to it yet:

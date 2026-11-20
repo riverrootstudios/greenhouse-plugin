@@ -17,11 +17,16 @@ So every chat works in its own git worktree, and everything shared goes through 
 ## 1. Your identity in the coordinator
 
 - **Dashboard first:** `gh-dash --detach` (a no-op when it's already running). It's how Greenhouse sees this machine's chats and how a ticket page starts chats here.
-- **Paths:** `eval "$(GC paths {KEY}-{n})"` gives `$MAIN` (the main checkout) and `$WT`, the ticket's worktree: a sibling of the main checkout named `<repo>-{n}`. `$WT` is the same for the ticket's whole life, shared by its work, fix and merge chats in turn.
+- **Paths:** `eval "$(GC paths {KEY}-{n})"` gives `$MAIN` (the main checkout) and `$WT`, the ticket's worktree: `$MAIN/.claude/worktrees/{key}-{n}` (GH-134), where EnterWorktree goes in without a permission prompt. `GC paths` also keeps that folder out of the main checkout's `git status` (a line in `.git/info/exclude`). A ticket whose worktree already sits beside the main checkout (`<repo>-{n}`, the old place) keeps it. `$WT` is the same for the ticket's whole life, shared by its work, fix and merge chats in turn.
 - **Label:** `{KEY}-{n}/work`, `{KEY}-{n}/fix`, `{KEY}-{n}/review` or `{KEY}-{n}/merge`.
 - **Claim before touching anything:** `GC claim {KEY}-{n} <label> "$WT"`. `TAKEN` means another chat has it: leave that ticket alone, pick another or stop. `GC unclaim {KEY}-{n} <label>` on every way out: done, handed off or gave up.
-- **Your chat is recorded for you.** Every `GC` call from a Claude Code chat updates its record: `claim` sets its ticket and role, and `db-wait`, `db-run` and `heavy-run` set what it's running. When Claude Code raises a Notification for the chat (`permission_prompt`, `elicitation_dialog`, `agent_needs_input`, or `idle_prompt` after a minute waiting on input), the plugin's hook marks it as needing someone. Nothing extra to call.
+- **Your chat is recorded for you.** Every `GC` call from a Claude Code chat updates its record: `claim` sets its ticket and role, and `db-wait`, `db-run` and `heavy-run` set what it's running. The plugin's hooks mark it as needing someone: an `AskUserQuestion` box sets `question` when it opens and clears it when it's answered (GH-134), and a Notification (`permission_prompt`, `elicitation_dialog`, `agent_needs_input`, or `idle_prompt` after a minute waiting on input) sets its own kind. A Notification never downgrades an open box's `question` to `idle` or restarts its wait, so a loop waiting on a box stays on the Agents page's Waiting list until it's answered. Nothing extra to call.
 - **Greenhouse:** `eval "$(GC greenhouse-env)"` authenticates (`gh-jwt`) and exports `GREENHOUSE_PROJECT_ID` and `GREENHOUSE_PROJECT_KEY`.
+- **No `eval` inside the worktree.** Once a chat has called EnterWorktree, Claude Code refuses any command it can't check stays inside the worktree, and `eval "$(…)"` is one of them, so `eval "$(gh-jwt)"`, `eval "$(GC greenhouse-env)"` and `eval "$(GC paths …)"` stop working there. Shell variables don't survive between Bash calls either. So, inside the worktree:
+  - Read the values once with plain commands and write them into later commands literally: `GC paths {KEY}-{n}` (`MAIN`, `WT`), `GC config` (`KEY`, `PROJECT_ID`, `BASE`), `gh-api whoami` (`GREENHOUSE_ORG_ID`, `GREENHOUSE_TEAM_USERNAME`; it never prints the token).
+  - Call Greenhouse with `gh-api <METHOD> <path> [<payload file> | - | <json>]` instead of `eval "$(gh-jwt)"` plus curl. It sends the same headers and curl flags, asks for the written rows back on writes, and exits 1 with the response on stderr when the call fails.
+  - Write multi-line payloads (comment bodies, criteria) to a file with the Write tool, then build the JSON with `jq --rawfile` as [common-operations](common-operations.md#posting-comments-and-patching-multi-line-ticket-fields) shows. A heredoc can be refused for the same reason as `eval`.
+  - Call the plugin's tools by name (`gh-coord`, `gh-api`, `gh-dash`; the plugin's `bin/` is on the PATH) or by their literal path, never through a variable like `$GC`.
 - **Naming:** a chat started from gh-dash or a ticket page already has its name (`{key}-{n}` for work, `{key}-{n} {kind}` otherwise). A skill can't rename its own chat. When a chat started by hand has no name, print the `/rename` line for the user once and carry on.
 
 ## 2. The main checkout is off limits
@@ -42,7 +47,7 @@ git -C "$MAIN" worktree add "$WT" <branch>
 GC worktree-setup "$WT"        # copies the gitignored .env* files from $MAIN
 ```
 
-Then run the project's install step from CLAUDE.md's Common Commands inside `$WT` (a frozen-lockfile install), and call **EnterWorktree with `path: $WT`** so every later Bash, Read and Edit happens there. If EnterWorktree refuses the path, prefix every Bash command with `cd "$WT" &&` and use absolute `$WT` paths for Read and Edit. Before every commit, check that `pwd` and `git branch --show-current` are the worktree and the ticket's branch.
+Then run the project's install step from CLAUDE.md's Common Commands inside `$WT` (a frozen-lockfile install), and call **EnterWorktree with `path: $WT`** so every later Bash, Read and Edit happens there. A worktree under `$MAIN/.claude/worktrees/` goes in without a prompt; one beside the main checkout (the old place) asks the user first, every time. If EnterWorktree refuses the path, prefix every Bash command with `cd "$WT" &&` and use absolute `$WT` paths for Read and Edit. Before every commit, check that `pwd` and `git branch --show-current` are the worktree and the ticket's branch.
 
 ## 4. What needs a lock
 
@@ -82,7 +87,7 @@ Before creating a migration, run `GC migration-floor`: the highest migration ver
 
 ## 7. Shared memory files
 
-Other chats write memory at the same time. Edit a memory index only with Edit (a one-line insert or change), re-read it right before, and never Write the whole file. Progress a later chat needs (the approved sha, a parked question, what a tick pushed) goes in the ticket's Greenhouse comments, where every chat and every teammate can read it.
+Other chats write memory at the same time. Edit a memory index only with Edit (a one-line insert or change), re-read it right before, and never Write the whole file. Progress a later chat needs (the approved sha, what a tick pushed, a decision the user made and why) goes in the ticket's Greenhouse comments, where every chat and every teammate can read it.
 
 ## 8. The user's own database use
 
@@ -90,4 +95,21 @@ When the user resets or tests from the main checkout, they take the lock too: `G
 
 ## 9. Under `/loop`
 
-Review, fix and merge chats run under `/loop`: `/loop 5m /greenhouse:review-pr --agent`, `/loop 5m /greenhouse:fix-review-feedback --agent` or `/loop 5m /greenhouse:merge-pr --agent` (leave out the interval to self-pace). Each invocation is one tick. Settle every question at the start of a chat, while the user is still at the keyboard; after that a tick never stops to ask. A question that comes up later is asked once, in one batched message with a recommendation for each item. Later ticks print one line (`{KEY}-{n}: still waiting on your answer above`) and keep working other tickets. A quiet tick (nothing to do) is one line.
+Review, fix and merge chats run under `/loop`: `/loop 5m /greenhouse:review-pr --agent`, `/loop 5m /greenhouse:fix-review-feedback --agent` or `/loop 5m /greenhouse:merge-pr --agent` (leave out the interval to self-pace). Each invocation is one tick.
+
+- **Stamp the tick, at both ends.** A tick's first command is a plain `GC tick`, so "last ran" moves as soon as it starts. It clears the due time: a running tick has none, so one that spends 20 minutes on a quality gate or a large diff never reads as stopped. Its last command, after any box is answered and right before a self-paced loop schedules its wakeup, is `GC tick <minutes to the next tick>`: the loop's interval, or for a self-paced loop the delay it has just chosen. Only this end stamp sets when the next tick is due. The Agents page reads a loop as stopped once two of its intervals pass with no tick, so the due time has to be measured from the end of the tick: a self-paced loop that goes from 5 minutes to 25, or a tick that spent half an hour on a box, would otherwise read as stopped while it sleeps. A one-shot `--agent` run stamps nothing.
+- **Settle what you can at the start**, while the user is still at the keyboard.
+- **Person-free work first, then one box.** A tick does everything it can without a person first: posting clean verdicts, merging green PRs, fixing structured `[REQUIRED]` items. Then it asks every judgment item it found in one box ([common-operations §Asking the User](common-operations.md#asking-the-user)), each a decision brief, and waits for the answer before the tick ends. A box holds up to 4 questions; a tick with more asks the 4 oldest and the rest next tick.
+- **The loop waits on the box.** A scheduled tick fires only while the chat is idle, so an open box holds the loop: no stacked ticks, and nothing decided behind the user's back. A box that comes back unanswered is asked again, never decided. There's no parking a question and no "still waiting" line.
+- **Record the answer before the tick ends**: the ticket's round comment, and the PR body when it changes the PR. A chat that dies after the answer doesn't lose it.
+- A quiet tick (nothing to do) is one line.
+
+## 10. Walking away
+
+Loops wait on their boxes, so you can leave them running and answer from your phone. Set this up once per machine:
+
+- **Remote Control for every session**: `"remoteControlAtStartup": true` in `~/.claude/settings.json` (or the same toggle in VS Code's Claude Code settings). Chats are listed under **Code** in the Claude app, and a box reaches your phone as a push notification.
+- **In `~/.claude/settings.json`**: `"askUserQuestionTimeout": "never"`, so the app never moves on from an unanswered box (a box that lapses is asked again anyway, never decided), and `"inputNeededNotifEnabled": true` for the push. If an answer from your phone after 5+ minutes doesn't reach the chat, add `"dialogExpiry": "never"` too.
+- **Keep the lid open.** gh-dash keeps the Mac awake (`caffeinate -is`, shown as "keeping awake" on its page) while any agent chat is open, but closing the lid still sleeps it.
+- **Stop a loop by sending it a message.** Run `/remote-control` to reconnect a chat after a 30-minute disconnect. `/loop` jobs expire after 7 days.
+- The Greenhouse Agents page lists what's waiting on whom and for how long, flags a loop that missed two ticks, and (Profile → Agent wait alert) raises a browser alert in any open tab when one of your chats has waited past your threshold.

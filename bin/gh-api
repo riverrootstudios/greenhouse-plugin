@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# gh-api — one Greenhouse REST call with this machine's session, no `eval` needed (GH-134).
+#
+# Skills authenticate with `eval "$(gh-jwt)"` before each curl, but a chat inside a worktree it
+# entered with EnterWorktree can't run `eval`: Claude Code refuses any command whose text it can't
+# check stays inside the worktree. gh-api does the same call as a plain command. It runs gh-jwt
+# itself, sends the standard headers and curl flags, and asks for the written rows back on writes.
+#
+#   gh-api GET    '/rest/v1/tickets?display_id=eq.GH-1&select=status'
+#   gh-api PATCH  '/rest/v1/tickets?display_id=eq.GH-1' payload.json      a JSON file, - for stdin,
+#   gh-api POST   /rest/v1/comments '{"ticket_id": "..."}'                 or the JSON itself
+#   gh-api whoami                                                         identity values, no token
+#
+# Prints the response body. Exits 0 on 2xx, 1 on an HTTP error (the body goes to stderr), 2 when
+# Greenhouse can't be reached or there's no session.
+set -uo pipefail
+
+BIN="$(cd "$(dirname "$0")" && pwd)"
+usage() { sed -n '9,12p' "$0" | sed 's/^# *//' >&2; exit 64; }
+
+env_out=$("$BIN/gh-jwt") || { echo "gh-api: no Greenhouse session (run /greenhouse:setup)" >&2; exit 2; }
+eval "$env_out"
+
+method="${1:-}"
+case "$method" in
+  whoami)
+    printf 'GREENHOUSE_URL=%s\nGREENHOUSE_ORG_ID=%s\nGREENHOUSE_USER_ID=%s\nGREENHOUSE_TEAM_USERNAME=%s\n' \
+      "${GREENHOUSE_URL:-}" "${GREENHOUSE_ORG_ID:-}" "${GREENHOUSE_USER_ID:-}" "${GREENHOUSE_TEAM_USERNAME:-}"
+    exit 0 ;;
+  GET|DELETE) [ $# -eq 2 ] || usage ;;
+  POST|PATCH) [ $# -eq 3 ] || usage ;;
+  *) usage ;;
+esac
+path="$2"
+case "$path" in /*) ;; *) echo "gh-api: the path starts with /, e.g. /rest/v1/tickets" >&2; exit 64 ;; esac
+
+args=(-sS --connect-timeout 5 --max-time 15 --retry 2 -X "$method" "${GREENHOUSE_URL}${path}"
+  -H "apikey: ${GREENHOUSE_PUBLIC_KEY}" -H "Authorization: Bearer ${GREENHOUSE_JWT}"
+  -o /dev/stdout -w '\n%{http_code}')
+if [ "$method" = POST ] || [ "$method" = PATCH ]; then
+  args+=(-H "Content-Type: application/json" -H "Prefer: return=representation")
+  case "$3" in
+    -) args+=(--data-binary @-) ;;
+    \{*|\[*) args+=(--data-binary "$3") ;;
+    *) [ -f "$3" ] || { echo "gh-api: no such payload file: $3" >&2; exit 64; }; args+=(--data-binary "@$3") ;;
+  esac
+fi
+
+out=$(curl "${args[@]}") || { echo "gh-api: Greenhouse unreachable ($method $path)" >&2; exit 2; }
+code="${out##*$'\n'}"; body="${out%$'\n'*}"
+if [ "${code:0:1}" = 2 ]; then
+  [ -n "$body" ] && printf '%s\n' "$body"
+  exit 0
+fi
+printf 'gh-api: %s %s failed (HTTP %s)\n%s\n' "$method" "$path" "$code" "$body" >&2
+exit 1

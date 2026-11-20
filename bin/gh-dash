@@ -1,4 +1,8 @@
-#!/usr/bin/env node
+#!/bin/sh
+':' //; command -v node >/dev/null 2>&1 || { printf '%s\n' "gh-dash: Node.js (18 or later) isn't on the PATH, and gh-dash runs on it. Install it from https://nodejs.org (or: brew install node). With nvm, Claude Code's shell may not load it: put its bin folder on the PATH in ~/.zshenv, then try again." >&2; exit 127; }; exec node "$0" "$@"
+// The two lines above are a sh/JavaScript polyglot (GH-134): sh checks for node and runs this file
+// with it, or says plainly that it's missing; node reads them as a string and a comment.
+//
 // gh-dash: the local dashboard for gh-coord (GH-129). Each chat is a card in its stage
 // (work -> review <-> fix -> merge -> the integration branch); arrows light when the coordinator log
 // shows a ticket moving between stages. Also the DB lock, heavy slots, the local stack, a lock
@@ -94,6 +98,8 @@ const alive = (pid) => { try { process.kill(Number(pid), 0); return true; } catc
 const mtimeMs = (f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
 const base = (p) => (p ? p.split('/').filter(Boolean).pop() : null);
 const iso = (ms) => (ms ? new Date(ms).toISOString() : null);
+// gh-coord's epoch-second stamps, as ms (0 when absent or garbled).
+const secs = (v) => (/^\d{1,12}$/.test(String(v || '')) ? Number(v) * 1000 : 0);
 // What leaves the machine: `doing` without NAME=value pairs (env values), at most 120 characters.
 const sanitize = (s) => (s ? String(s).replace(/\n/g, ' ').replace(/(^|\s)[A-Za-z_][A-Za-z0-9_]*=\S*/g, '$1').replace(/\s+/g, ' ').trim().slice(0, 120) || null : null);
 
@@ -208,10 +214,12 @@ function locks(now) {
   return { db, waiting, heavy };
 }
 
-// The plugin's Notification hook records what a chat is waiting on (gh-coord needs-you). It's
-// answered once the chat writes its transcript again. Loop chats sit idle between ticks, so idle
+// The plugin's hooks record what a chat is waiting on (gh-coord needs-you): an AskUserQuestion box
+// (`question`, GH-134) or a Notification. A Notification is answered once the chat writes its
+// transcript again; a question isn't, since a chat can write its transcript while its box is still
+// open: it clears only when gh-coord seen clears it. Loop chats sit idle between ticks, so idle
 // only counts for chats that aren't loops.
-const NEEDS = { permission_prompt: 'permission', idle_prompt: 'idle', agent_needs_input: 'question', elicitation_dialog: 'question' };
+const NEEDS = { question: 'question', permission_prompt: 'permission', idle_prompt: 'idle', agent_needs_input: 'question', elicitation_dialog: 'question' };
 const LOOP_NAME = new RegExp(`^${key}-(review|fix|merge|work) \\d+$`);
 const firstTurnSeen = new Set();
 // A chat has got going once it calls gh-coord (which writes path=), Claude Code reports a status
@@ -220,7 +228,7 @@ const firstTurnSeen = new Set();
 function needsOf(o, id, name, now, session) {
   if (o.needs) {
     const kind = NEEDS[o.needs] || 'question';
-    const answered = o.transcript && mtimeMs(o.transcript) > Number(o.needs_at) * 1000 + 1000;
+    const answered = kind !== 'question' && o.transcript && mtimeMs(o.transcript) > Number(o.needs_at) * 1000 + 1000;
     if (!answered && !(kind === 'idle' && LOOP_NAME.test(name || ''))) return kind;
   }
   const going = !!o.path || ['busy', 'idle', 'waiting'].includes(session?.status) || firstTurnSeen.has(id);
@@ -250,8 +258,16 @@ function rows(now, { db, waiting, heavy }) {
       doing: o.doing || null, path: o.path || session?.cwd || null, seen: o.mtime, name, since: localTime(o.since),
       open: !!session, status: agents.status.get(id) ?? (session && (session.status === 'busy' || session.status === 'idle') ? session.status : null),
       needs: needsOf(o, id, name, now, session), mode: o.mode || null,
+      needsAt: secs(o.needs_at) || null, startedAt: secs(o.started) || null,
+      tickAt: secs(o.tick_at) || null, tickDue: secs(o.tick_due) || null,
     };
   }).filter(Boolean);
+  for (const h of chats) {
+    // How long it has waited (a wait stuck at startup counts from the start), and whether a loop
+    // has missed two of its ticks while live and not waiting on anyone (GH-134).
+    h.needsSince = !h.needs ? null : h.needs === 'startup' ? h.startedAt : h.needsAt;
+    h.loopStopped = !!(h.open && !h.needs && h.tickAt && h.tickDue > h.tickAt && now > h.tickAt + 2 * (h.tickDue - h.tickAt));
+  }
   const used = new Set();
   const out = ls(path.join(STATE, 'claims')).map((ticket) => {
     const c = kvFile(path.join(STATE, 'claims', ticket, 'owner')) || {};
@@ -674,6 +690,9 @@ function reportPayload(s) {
       role: ROLES.includes(r.role) ? r.role : null,
       doing: sanitize(r.doing),
       needs_you: r.chat.needs,
+      needs_since: iso(r.chat.needsSince),
+      last_tick_at: iso(r.chat.tickAt),
+      tick_due_at: iso(r.chat.tickDue),
       folder: base(r.worktree || r.chat.path),
       started_at: iso(r.chat.since),
     })),
@@ -683,9 +702,9 @@ function reportPayload(s) {
 // Only when something visible changed, at most every 10 s, failed tries included. There's no
 // heartbeat: the queue check below keeps "last seen" fresh. The server ignores a report under 5 s
 // after the last and returns false; then this simply tries again on a later tick.
-async function reportTick() {
+async function reportTick(state) {
   if (gh.busy || !PROJECT_ID || Date.now() < gh.backoffUntil) { if (!PROJECT_ID) gh.state = 'off'; return; }
-  const payload = reportPayload(reportState());
+  const payload = reportPayload(state || reportState());
   const key = JSON.stringify(payload);
   if (key === gh.lastKey || Date.now() - gh.lastTry < 10e3) return;
   gh.busy = true;
@@ -700,6 +719,26 @@ async function reportTick() {
   } catch (e) { gh.state = 'error'; ghError(`report_agent_state failed: ${e.message}`); }
   finally { gh.busy = false; }
 }
+
+// Walking away (GH-134): while any agent chat is open, one `caffeinate -is` keeps the Mac awake (not
+// the display, and closing the lid still sleeps it). -w ties it to this process, so it can't outlive
+// gh-dash. Elsewhere it's a no-op. Nothing about it is reported.
+const awake = { proc: null };
+function keepAwake(on) {
+  if (process.platform !== 'darwin') return;
+  if (on && !awake.proc) {
+    try {
+      const p = spawn('caffeinate', ['-is', '-w', String(process.pid)], { stdio: 'ignore' });
+      p.on('error', () => { if (awake.proc === p) awake.proc = null; });
+      p.on('exit', () => { if (awake.proc === p) awake.proc = null; });
+      awake.proc = p;
+    } catch {}
+  } else if (!on && awake.proc) {
+    try { awake.proc.kill(); } catch {}
+    awake.proc = null;
+  }
+}
+const anyOpenChat = (rs) => rs.some((r) => r.chat && r.chat.open);
 
 // A clean stop: every chat on this machine ends and it shows as stopped, rather than waiting ten
 // silent minutes to read as offline.
@@ -817,7 +856,7 @@ function snapshot() {
     stack: stack.text, stackDown: !!LOCAL_STACK && !!stack.downSince && now - stack.downSince > STACK_GRACE_MS,
     dev: { merged: dev.merged.filter((m) => m.ts >= midnight()), error: dev.error },
     ...current, rows: rows(now, current), ...hist, machine: machine(), starts: nextLoopNames(openChats()),
-    modes: MODES, mode: readMode(), terminalApp: TERMINAL === 'iterm' ? 'iTerm' : 'Terminal',
+    modes: MODES, mode: readMode(), terminalApp: TERMINAL === 'iterm' ? 'iTerm' : 'Terminal', awake: !!awake.proc,
     greenhouse: { state: gh.state, lastSent: gh.lastSent || null, error: gh.error, started: gh.started, live: rt.joined },
   };
 }
@@ -879,7 +918,12 @@ function listen(port, tries) {
     // busy/idle) refresh when it asks for state, so nothing spawns while nobody has it open.
     refreshStack();
     sampleCpu(); setInterval(sampleCpu, 2000);
-    setInterval(() => { refreshStack(); void reportTick(); }, 2000);
+    setInterval(() => {
+      refreshStack();
+      const state = reportState();
+      keepAwake(anyOpenChat(state.rows));
+      void reportTick(state);
+    }, 2000);
     setInterval(queueSafetyNet, 5000);
     setInterval(rtRefreshToken, 60e3);
     rtConnect();
@@ -890,6 +934,7 @@ function listen(port, tries) {
 }
 
 function cleanup() {
+  keepAwake(false);
   try { if (Number(fs.readFileSync(PID_FILE, 'utf8')) === process.pid) { fs.unlinkSync(PID_FILE); fs.unlinkSync(PORT_FILE); } } catch {}
 }
 
@@ -1039,6 +1084,7 @@ const PAGE = String.raw`<!doctype html>
   .s-run .st, .s-act .st { color: var(--g); } .s-held .st, .s-wait .st, .s-need .st { color: var(--a); } .s-alarm .st { color: var(--r); }
   .tk { color: var(--hi); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .age { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; }
+  .card-loop { margin-top: 2px; font-size: 11px; color: var(--fg); }
   .card-do { margin-top: 3px; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; }
   .card-meta { margin-top: 4px; color: var(--dim); font-size: 11px; display: flex; flex-wrap: wrap; gap: 3px 8px; align-items: center; }
   .tag { border: 1px solid currentColor; padding: 0 4px; font-size: 10px; letter-spacing: .08em; line-height: 15px; }
@@ -1230,12 +1276,17 @@ function card(r, now) {
   var unclaim = quiet && !r.doing ? '<div class="card-fix" title="run this if the chat is gone">gh-coord unclaim ' + esc(r.ticket + ' ' + r.label) + '</div>' : '';
   var last = !r.ticket && r.chat && r.chat.lastTicket ? '<span>last ' + esc(r.chat.lastTicket) + '</span>' : '';
   var status = r.chat && r.chat.status ? '<span class="tag ' + (r.chat.status === 'busy' ? 'g' : 'd') + '">' + r.chat.status + '</span>' : '';
+  var waited = needs && r.chat.needsSince ? ' &middot; waiting ' + ago(now - r.chat.needsSince) : '';
+  var loop = r.chat && r.chat.tickAt
+    ? '<div class="card-loop' + (r.chat.loopStopped ? ' a' : r.chat.open ? '' : ' d') + '" title="when this loop last ticked (gh-coord tick)">' +
+      (r.chat.loopStopped ? 'loop stopped? missed 2 ticks &middot; ' : '') + 'last ran ' + ago(now - r.chat.tickAt) + ' ago</div>'
+    : '';
   return '<div class="card ' + st[0] + '">' +
     '<div class="card-top"><i class="lamp"></i><b class="st">' + st[1] + '</b>' +
     '<span class="tk">' + esc(r.ticket || name || r.label || 'chat') + '</span>' +
     '<span class="age" title="claimed this long ago">' + (r.claimed ? ago(now - r.claimed) : '') + '</span></div>' +
     (r.ticket && name ? '<div class="card-name" title="chat name">' + esc(name) + '</div>' : '') +
-    (doing ? '<div class="card-do' + (needs ? ' a' : r.doing ? '' : ' d') + '" title="' + esc(doing) + '">' + esc(doing) + '</div>' : '') + unclaim +
+    (doing ? '<div class="card-do' + (needs ? ' a' : r.doing ? '' : ' d') + '" title="' + esc(doing) + '">' + esc(doing) + waited + '</div>' : '') + loop + unclaim +
     '<div class="card-meta">' + status + r.locks.map(tag).join('') + last + '<span>' + esc(base(r.worktree)) + '</span>' +
     '<span title="last gh-coord call from this chat">seen ' + (seen == null ? '-' : ago(seen)) + '</span></div>' +
     '</div>';
@@ -1364,7 +1415,8 @@ function renderLocks(s) {
   $('sys-stack').innerHTML =
     '<div class="line"><span class="k">db-stack</span>' + (!s.localStack ? lamp('', 'NONE') : up ? lamp('s-run', 'UP') : s.stackDown ? lamp('s-alarm', 'DOWN') : lamp('', '...')) + '<span class="d">' + esc(s.stack) + '</span></div>' +
     '<div class="line"><span class="k">chats</span><span class="hi">' + claimed + '</span><span class="d">claimed</span><span class="hi">' + (s.rows.length - claimed) + '</span><span class="d">idle</span></div>' +
-    '<div class="line"><span class="k">machine</span><span class="d">' + esc(s.machineName) + '</span></div>';
+    '<div class="line"><span class="k">machine</span><span class="d">' + esc(s.machineName) + '</span>' +
+    (s.awake ? '<span class="g" title="caffeinate -is runs while any agent chat is open; closing the lid still sleeps the Mac">keeping awake</span>' : '') + '</div>';
 }
 
 function renderTimeline(s) {
@@ -1498,7 +1550,7 @@ var lastKey = '', lastDraw = 0;
 function render(s) {
   renderStarts(s); renderModes(s); renderAlerts(s); renderMachine(s); renderGreenhouse(s);
   // Redraw on change, or every 10s for the ages, so a text selection survives between polls.
-  var k = JSON.stringify([s.rows, s.db, s.waiting, s.heavy, s.stack, s.stackDown, s.dev, s.flows, s.log[0]]);
+  var k = JSON.stringify([s.rows, s.db, s.waiting, s.heavy, s.stack, s.stackDown, s.awake, s.dev, s.flows, s.log[0]]);
   if (k === lastKey && Date.now() - lastDraw < 10000) return;
   lastKey = k; lastDraw = Date.now();
   renderStages(s); renderFlows(s); renderLocks(s); renderTimeline(s); renderLog(s);

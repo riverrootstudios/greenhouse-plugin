@@ -25,7 +25,7 @@
 #
 #   gh-coord status
 #   gh-coord config                                       KEY=value lines (gh-dash reads these)
-#   gh-coord paths           <TICKET>                     prints MAIN= WT= (eval it)
+#   gh-coord paths           <TICKET>                     prints MAIN= WT= (WT: <main>/.claude/worktrees/<key>-<n>)
 #   gh-coord greenhouse-env                               Greenhouse auth + project exports (eval it)
 #   gh-coord worktree-setup  <worktree>                   copy gitignored .env* files from the main checkout
 #   gh-coord db-stack                                     up | down | other:<project> | none (exit 0 | 1 | 2 | 0)
@@ -40,9 +40,15 @@
 #   gh-coord working         <ticket> <role> | -          label this chat's ticket and role without a claim (GH-133:
 #                                                         tend-ticket's pill); `-` clears them. Never blocks anyone
 #   gh-coord migration-floor                              highest migration version across origin/<base> + every worktree
-#   gh-coord needs-you       [<notification type>]        from the plugin's Notification hook (JSON on stdin)
-#   gh-coord seen                                         from the plugin's PostToolUse/UserPromptSubmit hooks: the chat is
-#                                                         going (clears gh-dash's starting marker) and not waiting (clears needs-you)
+#   gh-coord tick            [<minutes to the next tick>] a /loop tick's stamps (GH-134). Its first call, plain `tick`,
+#                                                         stamps tick_at and clears tick_due (a running tick has no due
+#                                                         time). Its last, `tick <minutes>`, stamps tick_at and tick_due
+#   gh-coord needs-you       [<type>]                     from the plugin's hooks (JSON on stdin): a Notification's type, or
+#                                                         `question` from the AskUserQuestion PreToolUse hook (GH-134)
+#   gh-coord seen            [box | prompt]               from the plugin's PostToolUse/UserPromptSubmit hooks: the chat is
+#                                                         going (clears gh-dash's starting marker) and not waiting (clears
+#                                                         needs-you). An open box's question clears only on `box` (its own
+#                                                         PostToolUse) or `prompt` (a typed message dismisses the box)
 set -uo pipefail
 
 BIN="$(cd "$(dirname "$0")" && pwd)"
@@ -146,8 +152,12 @@ chat_set() {
 
 # needs-you runs from a Claude Code hook in every session of every plugin user, so it never creates
 # state and does nothing for a chat the coordinator doesn't already know.
+#
+# An open box (needs=question) outranks every Notification, and idle_prompt never replaces another
+# need: Claude Code raises idle_prompt about a minute into a box, and a loop waiting on its box must
+# stay waiting. A wait keeps its first needs_at; only a new box starts a new one (GH-134).
 needs_you() {
-  local type="${1:-}" input="" sid tp cwd
+  local type="${1:-}" input="" sid tp cwd old
   [ -t 0 ] || input=$(head -c 65536)
   sid=$(json_str "$input" session_id); tp=$(json_str "$input" transcript_path); cwd=$(json_str "$input" cwd)
   [ -n "$type" ] || type=$(json_str "$input" notification_type)
@@ -157,7 +167,15 @@ needs_you() {
   load_config 2>/dev/null || return 0
   [ -f "$CHATS/$sid" ] || return 0
   CHAT="$sid"
-  chat_set "needs=$type" "needs_at=$(now)" ${tp:+"transcript=$tp"}
+  old=$(kv "$CHATS/$sid" needs)
+  if [ -z "$old" ] || { [ "$type" = question ] && [ "$old" != question ]; }; then
+    set -- "needs=$type" "needs_at=$(now)"
+  elif [ "$old" = question ] || [ "$type" = idle_prompt ]; then
+    set --
+  else
+    set -- "needs=$type"
+  fi
+  chat_set "$@" ${tp:+"transcript=$tp"}
   # The marker `seen` looks for: the record to clear once the chat moves again.
   mkdir -p -m 700 "$MARKERS/needs" && printf '%s' "$CHATS/$sid" >"$MARKERS/needs/$sid"
   return 0
@@ -169,13 +187,16 @@ needs_you() {
 # marker means it's no longer waiting. Claude Code builds that write no transcript can't tell
 # gh-dash either of those any other way.
 seen() {
-  local sid="${CLAUDE_CODE_SESSION_ID:-}" kind m rec
+  local how="${1:-}" sid="${CLAUDE_CODE_SESSION_ID:-}" kind m rec
   [ -n "$sid" ] || { [ -t 0 ] || sid=$(json_str "$(head -c 65536)" session_id); }
   [ -n "$sid" ] || return 0
   for kind in starting needs; do
     m="$MARKERS/$kind/$sid"
     [ -f "$m" ] || continue
-    rec=$(cat "$m"); rm -f "$m"
+    rec=$(cat "$m")
+    # Any other tool call leaves an open box's question (and its marker) alone.
+    [ "$kind" = needs ] && [ -z "$how" ] && [ -f "$rec" ] && grep -qx 'needs=question' "$rec" && continue
+    rm -f "$m"
     [ -f "$rec" ] || continue
     if [ "$kind" = needs ]; then
       grep -v -e '^needs=' -e '^needs_at=' "$rec" >"$rec.tmp.$$" && mv "$rec.tmp.$$" "$rec"
@@ -187,7 +208,7 @@ seen() {
 
 # Markers live outside the state folder so a hook can find them without reading any config.
 MARKERS="${GREENHOUSE_MARKERS_DIR:-/tmp/greenhouse-agents-${UID:-$(id -u)}}"
-if [ "${1:-}" = seen ]; then seen; exit 0; fi
+if [ "${1:-}" = seen ]; then case "${2:-}" in box|prompt) seen "$2" ;; *) seen ;; esac; exit 0; fi
 if [ "${1:-}" = needs-you ]; then shift; needs_you "$@"; exit 0; fi
 
 load_config; rc=$?
@@ -300,8 +321,20 @@ case "$cmd" in
   paths)
     [ $# -ge 1 ] || { echo "usage: paths <TICKET>" >&2; exit 64; }
     n=$(lower "${1##*-}")
+    # GH-134: under the main checkout's .claude/worktrees/, where Claude Code's EnterWorktree goes in
+    # without a permission prompt. A ticket that already has a worktree beside the main checkout
+    # (the old place, <repo>-<n>) keeps it.
+    wt="$MAIN/.claude/worktrees/$(lower "$KEY")-$n"
+    old="$(dirname "$MAIN")/$(basename "$MAIN")-$n"
+    [ ! -e "$wt" ] && [ -e "$old/.git" ] && wt="$old"
+    # Keep the folder out of the main checkout's git status without touching a tracked file:
+    # info/exclude is local to this clone and shared by every worktree of it.
+    common=$(git -C "$MAIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+    if [ -n "$common" ] && ! grep -qx '/.claude/worktrees/' "$common/info/exclude" 2>/dev/null; then
+      mkdir -p "$common/info" && printf '/.claude/worktrees/\n' >>"$common/info/exclude"
+    fi
     echo "MAIN=$MAIN"
-    echo "WT=$(dirname "$MAIN")/$(basename "$MAIN")-$n"
+    echo "WT=$wt"
     ;;
   greenhouse-env)
     "$BIN/gh-jwt" || exit 1
@@ -416,6 +449,22 @@ case "$cmd" in
     case "${2:-}" in work|fix|review|merge|tend) ;; *) echo "usage: working <ticket> <work|fix|review|merge|tend>" >&2; exit 64 ;; esac
     chat_set "ticket=$1" "role=$2" "label=$1/$2"; echo "WORKING"
     ;;
+  tick)
+    # GH-134: when this /loop tick ran and when the next is due, so the Agents page can tell a loop
+    # that's waiting between ticks from one that stopped.
+    [ -n "$CHAT" ] || { echo "gh-coord: tick stamps a Claude Code chat; nothing to stamp here" >&2; exit 0; }
+    case "${1:-}" in
+      '') mins="" ;;
+      *[!0-9]*) echo "usage: tick [<minutes to the next tick, 1-10080>]" >&2; exit 64 ;;
+      *) mins=$((10#$1)); [ "$mins" -ge 1 ] && [ "$mins" -le 10080 ] || { echo "usage: tick [<minutes to the next tick, 1-10080>]" >&2; exit 64; } ;;
+    esac
+    # The start stamp (no minutes) clears tick_due: a running tick has no due time, so a long one
+    # (a quality gate, a big diff) never reads as stopped. Only the end stamp sets when the next is due.
+    at=$(now)
+    if [ -z "$mins" ]; then chat_set "tick_at=$at" "tick_due="; echo "TICK at $(stamp), running"; exit 0; fi
+    chat_set "tick_at=$at" "tick_due=$(( at + mins * 60 ))"
+    echo "TICK at $(stamp), next due in ${mins}m"
+    ;;
   migration-floor)
     [ -d "$MAIN/supabase/migrations" ] || exit 0
     git -C "$MAIN" fetch -q origin "$BASE" 2>/dev/null
@@ -423,5 +472,5 @@ case "$cmd" in
       git -C "$MAIN" worktree list --porcelain | sed -n 's/^worktree //p' | while read -r wt; do ls "$wt/supabase/migrations" 2>/dev/null; done
     } | grep -E '^[0-9]{14}' | sort -u | tail -1
     ;;
-  *) sed -n '2,43p' "$0"; exit 64 ;;
+  *) sed -n '2,51p' "$0"; exit 64 ;;
 esac

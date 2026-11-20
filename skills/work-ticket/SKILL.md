@@ -13,7 +13,7 @@ Pick up a ticket, plan, branch, and implement — interactively or autonomously 
 
 When `--agent` is in the arguments (typed by the user, or started by gh-dash or a ticket page), run Step 0 (Preflight) as usual, then read [references/agent-work.md](../../references/agent-work.md) and follow it. It wins wherever this skill says otherwise. Without `--agent`, ignore that file and run as usual.
 
-- Agent mode claims a tended ticket assigned to you (the one named, or your next one), settles every question up front, then implements it autonomously in the ticket's own git worktree, alongside other chats on this machine, through gh-coord. It ends in an open PR.
+- Agent mode claims a tended ticket assigned to you (the one named, or your next one), settles what it can now, then implements it autonomously in the ticket's own git worktree, alongside other chats on this machine, through gh-coord. A question that only shows up later is asked in a box once the work it doesn't touch is done, and the chat waits for the answer. It ends in an open PR.
 - Never switch to agent mode on your own. A general request ("work on RG-42", "implement it autonomously") is the normal skill below.
 - `GC` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-coord` and `DASH` = `${CLAUDE_PLUGIN_ROOT}/bin/gh-dash`. The reference file uses these names: Claude Code fills in the plugin's path here, not in a file read later.
 
@@ -59,7 +59,7 @@ ${CLAUDE_PLUGIN_ROOT}/bin/gh-heartbeat
 
 **Search term provided (e.g., "password reset"):**
 - `GET /rest/v1/tickets?project_id=eq.{id}&status=not.in.(harvest,weeded)&title=ilike.*{term}*&select=display_id,title,status,complexity,assignee`
-- Present matches and ask which one
+- Present matches and ask which one in a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), the matches as options
 
 **Not found:**
 > "Can't find that ticket. Want me to plan some new work, or do you have the ticket ID?"
@@ -74,15 +74,21 @@ Run the Blocker Check from [references/common-operations.md](../../references/co
 
 ### 1.4 Determine Mode
 
-Ask the user:
-> "Want me to implement this autonomously (I'll write the code, run tests, and open a PR while you do something else) or work through it with you?"
+Ask in one box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): header `{TICKET-ID}`, question `{TICKET-ID}: implement it autonomously or together?`, options **Autonomously** (I write the code, run tests and open a PR while you do something else) and **Together** (we work through it, with a checkpoint at every phase). Recommend autonomous for a tended ticket, together otherwise.
 
-If autonomous and ticket is not tended:
-> "This ticket hasn't been tended — tended tickets produce significantly better autonomous results. Want me to tend it first?"
+If autonomous and ticket is not tended, say "This ticket hasn't been tended — tended tickets produce significantly better autonomous results." and ask in a confirm box: **Tend it first** (recommended) or **Go on untended**.
 
 Store the chosen mode (`interactive` or `autonomous`) for use in Steps 3, 6, 7, 8.
 
 **Autonomous — settle the reviewer now.** The unattended run ends in `open-pr`, which must never stop on a question. Run [conventions §Reviewer Rule](../conventions/SKILL.md#reviewer-rule) here, while the user is still at the keyboard: with several candidates that asks the reviewer question now (a reviewer named with the request, like "autonomously, mb reviews", already answers it). Carry the answer to Step 8.
+
+### 1.5 Settle Open Decisions
+
+Before any code, in both modes, read the ticket's `open_decisions` ([open_decisions format](../../references/greenhouse-schema.md#open_decisions-format)):
+
+- **Open items** (`- [ ]` lines): ask each as a decision brief ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), up to 4 in one box, with the line's `recommend {X}` as the recommended option. Write every answer back ticked in one PATCH — `- [x] {question} → {answer} (${GREENHOUSE_TEAM_USERNAME}, {date})` — and post the answers and their reasons in one comment. Never start implementing while an item is open.
+- **Legacy free text** (no checkbox lines): show it, then one confirm box: **These are settled** (recommended when the criteria already answer them), or **Settle them now** (each becomes a brief as above). The answer goes back as ticked lines.
+- Ticked items (`- [x]`, including `→ assumed`) don't block.
 
 ---
 
@@ -110,7 +116,7 @@ Produce implementation plan following [templates/implementation-plan.md](../../t
 
 Refine complexity — if the plan reveals scope differs from the ticket's `complexity` score, note the updated value for the Greenhouse update in Step 5.
 
-If complexity reaches 64, warn the user: *"This is scoring 64pt — it's a large ticket. Want to split it, or proceed as one PR?"* If they choose to proceed, continue normally with self-review checkpoints between phases.
+If complexity reaches 64, warn the user — *"This is scoring 64pt — it's a large ticket."* — and ask as a decision brief ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): **One PR, with self-review between phases** or **Split it**. If they choose one PR, continue normally with self-review checkpoints between phases.
 
 ### Interactive mode (default)
 Present plan, iterate until approved. Wait for explicit approval before coding.
@@ -135,7 +141,9 @@ Resolve `{base}` with [Resolve Base Branch](../../references/common-operations.m
 
 Before branching, check whether the cwd is a worktree ([common-operations §Worktrees](../../references/common-operations.md#worktrees)). If it is, read its branch: when that branch belongs to a **different** ticket, or to a ticket that is `harvest` or `weeded`, stop — don't start new work in a finished ticket's worktree:
 
-> "This is the worktree for {other-ticket} ({status}). Remove it and continue {TICKET-ID} from the main checkout at {path}?"
+> "This is the worktree for {other-ticket} ({status})."
+
+Then a confirm box: **Remove it and continue {TICKET-ID} from the main checkout at {path}** (recommended) or **Stop**.
 
 Then state where the work will happen: *"Working in {the current checkout | a new worktree at {path}}."*
 
@@ -161,7 +169,7 @@ When `{base}` is an epic branch, note in the implementation plan: "Stacked on ep
 
 ### Stacked Branch (off another feature branch)
 If the ticket has a dependency on an unmerged PR:
-1. Interactive: confirm with user — *"RG-7 depends on RG-4 which is in PR #{N} on branch `{branch}`. Branch off that instead?"*
+1. Interactive: ask as a decision brief ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)) — *"RG-7 depends on RG-4, which is in PR #{N} on branch `{branch}`."* — options **Branch off `{branch}`** (recommended: the PR lands first) and **Branch off {base}**
 2. Autonomous: branch off parent automatically, note in implementation plan
 3. Note in implementation plan that this is a stacked branch
 
@@ -285,10 +293,9 @@ Scan the diff for known patterns from [references/review-patterns.md](../../refe
 ### Issues Found
 {list of issues, if any}
 
-All clear — ready to open PR, or address issues first?
 ```
 
-Wait for user confirmation before proceeding to Step 8.
+Then a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): header `{TICKET-ID}`, question `{TICKET-ID}: open the PR or fix first?`, options **Open the PR** (recommended when nothing was found) and **Fix the issues first** (recommended when something was). Wait for the answer before Step 8.
 
 **Autonomous mode:** Fix all issues found automatically, re-run quality gate. If a criterion can't be met and it's a blocker, revert status to `sprouted`, comment why, stop.
 
@@ -323,7 +330,7 @@ Post summary comment: `"Implementation complete. PR #{number} opened. Ready for 
 | Error | Action |
 |-------|--------|
 | Quality gate fails 3+ attempts (autonomous) | Revert ticket to `sprouted`, clear plan/branch/started_at, comment with failure details, stop |
-| Branch already exists | Check for uncommitted work — offer to continue or fresh start |
+| Branch already exists | Check for uncommitted work, then a confirm box: continue it (recommended) or start fresh |
 | Greenhouse API unreachable | Fall back to git-only workflow; queue Greenhouse updates |
 | Blocker not resolved | Note in relations, offer to implement blocker first or proceed anyway |
 | Acceptance criteria unclear | Comment on ticket asking for clarification; offer a spike ticket, created (with its blocker relation) only on a yes |
