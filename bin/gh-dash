@@ -15,6 +15,8 @@
 //   gh-dash                    serves http://127.0.0.1:${GREENHOUSE_DASH_PORT:-7777} (the next free port when taken)
 //   gh-dash --open             same, and opens it in the browser
 //   gh-dash --detach [--open]  starts it in the background, so it outlives the chat or terminal that started it
+//   gh-dash --stop             stops this repo's gh-dash the clean way (its chats show as ended in Greenhouse);
+//                              exits 1 if it's still running after 5 s, and never sends SIGKILL
 //   gh-dash --report-preview   prints exactly what it would send Greenhouse, and exits
 //
 // Reads gh-coord's config (the repo's greenhouse block plus GREENHOUSE_* env vars). Also honors
@@ -78,8 +80,8 @@ const CLAUDE_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.cl
 const SESSIONS = path.join(CLAUDE_DIR, 'sessions');
 const PROJECTS = path.join(CLAUDE_DIR, 'projects');
 const LOOPS = ['review', 'fix', 'merge'];
-const KINDS = ['review', 'fix', 'merge', 'work', 'tend'];
-const ROLES = ['work', 'review', 'fix', 'merge', 'tend'];
+const KINDS = ['review', 'fix', 'merge', 'work', 'tend', 'sow'];
+const ROLES = ['work', 'review', 'fix', 'merge', 'tend', 'sow'];
 const MODES = process.platform === 'darwin' ? ['terminal', 'background', 'vscode'] : ['background', 'vscode'];
 const PID_FILE = path.join(STATE, 'dash.pid');
 const PORT_FILE = path.join(STATE, 'dash.port');
@@ -95,6 +97,14 @@ const localTime = (s) => (s ? new Date(s.replace(' ', 'T')).getTime() : null);
 const within = (p, root) => !!p && !!root && (p === root || p.startsWith(root + '/'));
 const inRepo = (p) => !!p && (within(p, MAIN) || p.startsWith(MAIN + '-'));
 const alive = (pid) => { try { process.kill(Number(pid), 0); return true; } catch (e) { return e.code === 'EPERM'; } };
+// A pid's command line ('' once it's gone). kill -0 alone can't tell a pid reused after a crash or
+// reboot, or a zombie, from the process it used to be (GH-136).
+const PS_COMMAND = (pid) => ['-o', 'command=', '-p', String(Number(pid))];
+function commandOf(pid) {
+  try { return execFileSync('ps', PS_COMMAND(pid), { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).trim(); } catch { return ''; }
+}
+const commandLater = (pid) => new Promise((resolve) => execFile('ps', PS_COMMAND(pid), { timeout: 3000 }, (err, out) => resolve(err ? '' : String(out).trim())));
+const isDash = (pid) => alive(pid) && commandOf(pid).includes('gh-dash');
 const mtimeMs = (f) => { try { return fs.statSync(f).mtimeMs; } catch { return 0; } };
 const base = (p) => (p ? p.split('/').filter(Boolean).pop() : null);
 const iso = (ms) => (ms ? new Date(ms).toISOString() : null);
@@ -240,6 +250,11 @@ function needsOf(o, id, name, now, session) {
   return null;
 }
 
+// Chats ended from their card (GH-136), by session id. Remembered until gh-dash restarts or the
+// chat opens again: the claimed card shows the unclaim line at once, an unclaimed one leaves the
+// page, and neither is reported, so Greenhouse ends it at once instead of after the quiet hour.
+const stoppedChats = new Set();
+
 // One row per claim (with its chat when gh-coord knows it), then chats holding no claim.
 function rows(now, { db, waiting, heavy }) {
   const open = new Map(openChats().map((s) => [s.sessionId, s]));
@@ -247,6 +262,8 @@ function rows(now, { db, waiting, heavy }) {
     const o = kvFile(path.join(STATE, 'chats', id));
     if (!o) return null;
     const session = open.get(id);
+    if (session) stoppedChats.delete(id);
+    const stopped = !session && stoppedChats.has(id);
     let name = o.name || session?.name || null;
     // A chat started in VS Code keeps Claude's own title; show it by its claim instead.
     if (o.label && !(name || '').startsWith(`${key}-`)) {
@@ -257,7 +274,7 @@ function rows(now, { db, waiting, heavy }) {
       id, ticket: o.ticket || null, role: o.role || null, label: o.label || null, lastTicket: o.last_ticket || null,
       doing: o.doing || null, path: o.path || session?.cwd || null, seen: o.mtime, name, since: localTime(o.since),
       open: !!session, status: agents.status.get(id) ?? (session && (session.status === 'busy' || session.status === 'idle') ? session.status : null),
-      needs: needsOf(o, id, name, now, session), mode: o.mode || null,
+      needs: stopped ? null : needsOf(o, id, name, now, session), stopped, mode: o.mode || null,
       needsAt: secs(o.needs_at) || null, startedAt: secs(o.started) || null,
       tickAt: secs(o.tick_at) || null, tickDue: secs(o.tick_due) || null,
     };
@@ -285,7 +302,7 @@ function rows(now, { db, waiting, heavy }) {
       worktree: worktree || chat?.path || null, chat: chat || null,
     };
   }).sort((a, b) => (b.claimed || 0) - (a.claimed || 0));
-  chats.filter((h) => !used.has(h.id) && (h.open || now - h.seen < IDLE_CHAT_MIN * 60e3))
+  chats.filter((h) => !used.has(h.id) && !h.stopped && (h.open || now - h.seen < IDLE_CHAT_MIN * 60e3))
     .sort((a, b) => b.seen - a.seen)
     .forEach((h) => out.push({ ticket: h.ticket, label: h.label, role: h.role, worktree: h.path, chat: h }));
   for (const r of out) {
@@ -297,9 +314,11 @@ function rows(now, { db, waiting, heavy }) {
     r.doing = r.chat?.doing || (slots[0] && `heavy: ${slots[0].cmd}`) || (holdsDb && `db lock: ${db.purpose}`)
       || (q >= 0 && `waiting for the DB: ${waiting[q].purpose}`) || null;
     // Quiet: the page offers the unclaim line, and the report leaves the chat out, so Greenhouse ends
-    // it rather than showing a closed chat as live. Its next gh-coord call brings it back.
+    // it rather than showing a closed chat as live. Its next gh-coord call brings it back. A chat
+    // stopped from its card gets the same at once, with its own card text.
     const seen = r.chat ? r.chat.seen : r.claimed;
-    r.quiet = r.ticket && seen && !r.chat?.open && now - seen > QUIET_MIN * 60e3 ? now - seen : 0;
+    r.stopped = !!r.chat?.stopped;
+    r.quiet = !r.stopped && r.ticket && seen && !r.chat?.open && now - seen > QUIET_MIN * 60e3 ? now - seen : 0;
   }
   return out;
 }
@@ -540,8 +559,10 @@ function openInVscode(query, done = () => {}) {
 function preRecord(id, name, mode, kind, ticket) {
   const stamp = new Date().toLocaleString('sv-SE').slice(0, 19);
   const lines = [`since=${stamp}`, 'started_by=gh-dash', `started=${Math.floor(Date.now() / 1000)}`, `name=${name}`, `mode=${mode}`];
-  // tend never claims, so the record carries its ticket itself.
+  // tend never claims, so the record carries its ticket itself. sow has no ticket to claim, so the
+  // record carries its role, and Greenhouse's Agents page shows it under sow rather than idle.
   if (kind === 'tend' && ticket) lines.push(`ticket=${KEY}-${ticket}`, 'role=tend');
+  if (kind === 'sow') lines.push('role=sow');
   const record = path.join(STATE, 'chats', id);
   try {
     fs.writeFileSync(record, lines.join('\n') + '\n');
@@ -555,17 +576,26 @@ function preRecord(id, name, mode, kind, ticket) {
 const SKILL_OF = { work: 'work-ticket', fix: 'fix-review-feedback', review: 'review-pr', merge: 'merge-pr' };
 
 // With a ticket number, the skill runs once on that ticket. Without one, review, fix and merge start
-// a numbered 5-minute loop, and work picks the next tended ticket.
+// a numbered 5-minute loop, and work picks the next tended ticket. sow (GH-138) takes no ticket: it
+// runs sow-feedback, which asks which notes to sow, in "<key>-sow".
 function start(kind, ticket, mode, done) {
   if (!KINDS.includes(kind)) return done({ error: `unknown start: ${kind}` });
   if (!MODES.includes(mode)) return done({ error: `unknown mode: ${mode}` });
   if (kind === 'tend' && !ticket) return done({ error: 'enter a ticket number to tend' });
   const open = openChats();
-  let name, run;
-  if (ticket) {
-    const base = kind === 'work' ? `${key}-${ticket}` : `${key}-${ticket} ${kind}`;
+  let name, run, base;
+  if (kind === 'sow') {
+    base = `${key}-sow`;
+    run = '/greenhouse:sow-feedback';
+  } else if (ticket) {
+    base = kind === 'work' ? `${key}-${ticket}` : `${key}-${ticket} ${kind}`;
     run = kind === 'tend' ? `/greenhouse:tend-ticket ${KEY}-${ticket}` : `/greenhouse:${SKILL_OF[kind]} ${KEY}-${ticket} --agent`;
-    // An open chat on this ticket and kind ("<key>-129", "<key>-129 2", ...) comes forward instead.
+  } else {
+    name = nextLoopNames(open)[kind];
+    run = kind === 'work' ? '/greenhouse:work-ticket --agent' : `/loop 5m /greenhouse:${SKILL_OF[kind]} --agent`;
+  }
+  if (base) {
+    // An open chat with this name ("<key>-129", "<key>-129 2", "<key>-sow", ...) comes forward instead.
     const already = open.find((s) => isNameOf(s.name, base));
     if (already) {
       name = already.name;
@@ -575,9 +605,6 @@ function start(kind, ticket, mode, done) {
       return done({ name, already: true });
     }
     name = freeName(base, takenNames(open), false);
-  } else {
-    name = nextLoopNames(open)[kind];
-    run = kind === 'work' ? '/greenhouse:work-ticket --agent' : `/loop 5m /greenhouse:${SKILL_OF[kind]} --agent`;
   }
   holdName(name);
   if (mode === 'vscode') {
@@ -683,7 +710,7 @@ function reportPayload(s) {
       stack: stackState(),
       start_mode: readMode(),
     },
-    p_chats: s.rows.filter((r) => r.chat && !r.quiet).map((r) => ({
+    p_chats: s.rows.filter((r) => r.chat && !r.quiet && !r.stopped).map((r) => ({
       session_id: r.chat.id,
       name: r.chat.name ? String(r.chat.name).slice(0, 120) : null,
       ticket: r.ticket || null,
@@ -747,10 +774,11 @@ async function stopReport() {
   try { await rpc('report_agent_state', { ...reportPayload(reportState()), p_chats: [], p_stopping: true }); } catch {}
 }
 
-// Requests queued from a ticket page for this machine, taken until none is left. Each opens in the
-// mode the dashboard is set to when it's taken (GH-133), VS Code included: Greenhouse's message says
-// a VS Code start waits for Enter. A nudge that arrives while a start runs asks for another pass, so
-// a second request queued meanwhile is taken right after, not at the next safety-net check.
+// Requests queued from Greenhouse (a ticket page, or the Brainstorm pane for sow) for this machine,
+// taken until none is left. Each opens in the mode the dashboard is set to when it's taken (GH-133),
+// VS Code included: Greenhouse's message says a VS Code start waits for Enter. A nudge that arrives
+// while a start runs asks for another pass, so a second request queued meanwhile is taken right
+// after, not at the next safety-net check.
 async function queueTick() {
   if (!PROJECT_ID || !gh.creds || Date.now() < gh.backoffUntil) return;
   if (gh.polling) { gh.again = true; return; }
@@ -861,6 +889,38 @@ function snapshot() {
   };
 }
 
+// A clean stop, from SIGINT/SIGTERM (gh-dash --stop, Ctrl-C) or the page's Stop (GH-136): it tells
+// Greenhouse, taking at most 3 s, so the machine's chats end at once. The exit handler then removes
+// dash.pid and dash.port and ends caffeinate. A second call while one runs does nothing more.
+let shuttingDown = false;
+function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  rt.closing = true;
+  try { if (rt.ws) rt.ws.close(); } catch {}
+  setTimeout(() => process.exit(0), 3000);
+  void stopReport().finally(() => process.exit(0));
+}
+
+// Ends one chat from its card (GH-136): only a chat open in this repo (openChats) whose pid is still
+// a claude process, with SIGTERM, then up to 5 s for it to go. Never SIGKILL. Its claim and worktree
+// stay; stoppedChats takes it out of the report, and off the page unless it holds a claim (then its
+// card shows the unclaim line).
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const isClaude = async (pid) => alive(pid) && (await commandLater(pid)).includes('claude');
+async function stopChat(session, reply) {
+  const s = UUID_RE.test(String(session)) && openChats().find((c) => c.sessionId === session);
+  if (!s || !(await isClaude(s.pid))) return reply(404, { error: `that chat isn't open in ${KEY}` });
+  const row = reportState().rows.find((r) => r.chat && r.chat.id === session);
+  const name = row?.chat.name || s.name || session.slice(0, 8);
+  try { process.kill(Number(s.pid), 'SIGTERM'); } catch (e) { if (e.code !== 'ESRCH') return reply(500, { error: e.message }); }
+  for (const until = Date.now() + 5000; Date.now() < until;) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    if (!(await isClaude(s.pid))) { stoppedChats.add(session); return reply(200, { stopped: true }); }
+  }
+  reply(409, { error: `${name} is still running after 5 s (pid ${s.pid})` });
+}
+
 function readBody(req, cb) {
   let body = '';
   req.on('data', (c) => { body += c; if (body.length > 1024) req.destroy(); });
@@ -875,16 +935,22 @@ const server = http.createServer((req, res) => {
     refreshStack(); refreshDev(); refreshMachine(); refreshAgents();
     return json(200, snapshot());
   }
-  if ((req.url === '/api/start' || req.url === '/api/mode') && req.method === 'POST') {
-    // Only this page can start chats: a form on another site can't set this header, and another
-    // site's fetch with it needs a CORS preflight this server never answers.
+  if (['/api/start', '/api/mode', '/api/stop', '/api/stop-chat'].includes(req.url) && req.method === 'POST') {
+    // Only this page can start or stop chats: a form on another site can't set this header, and
+    // another site's fetch with it needs a CORS preflight this server never answers.
     if (req.headers['x-gh-dash'] !== '1') { res.writeHead(403); return res.end(); }
+    if (req.url === '/api/stop') {
+      // Reply first, then shut down once the reply has left (GH-136).
+      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+      return res.end(JSON.stringify({ stopping: true }), shutdown);
+    }
     return readBody(req, (q) => {
       if (req.url === '/api/mode') {
         if (!MODES.includes(q.mode)) return json(400, { error: `unknown mode: ${q.mode}` });
         try { fs.writeFileSync(MODE_FILE, `${q.mode}\n`); } catch (e) { return json(500, { error: e.message }); }
         return json(200, { mode: q.mode });
       }
+      if (req.url === '/api/stop-chat') return void stopChat(q.session, json);
       start(String(q.kind), /^\d{1,6}$/.test(q.ticket) ? q.ticket : '', readMode(), (out) => json(out.error ? 400 : 200, out));
     });
   }
@@ -899,7 +965,7 @@ function running() {
   try {
     const pid = Number(fs.readFileSync(PID_FILE, 'utf8'));
     const port = Number(fs.readFileSync(PORT_FILE, 'utf8'));
-    return pid && pid !== process.pid && alive(pid) ? { pid, port } : null;
+    return pid && pid !== process.pid && isDash(pid) ? { pid, port } : null;
   } catch { return null; }
 }
 const openBrowser = (url) => execFile(process.platform === 'darwin' ? 'open' : 'xdg-open', [url]);
@@ -947,6 +1013,24 @@ if (ARGS.includes('--report-preview')) {
   // One stack check (the report's only spawned reading), then print the payload. No network.
   refreshStack();
   setTimeout(() => { console.log(JSON.stringify(reportPayload(reportState()), null, 2)); process.exit(0); }, 2500);
+} else if (ARGS.includes('--stop')) {
+  // This repo's state folder only: another repo's dashboard keeps running. SIGTERM runs the same
+  // clean shutdown as the page's Stop; one that hasn't gone in 5 s is reported, never SIGKILLed.
+  const r = running();
+  if (!r) console.log(`gh-dash: not running for ${KEY}`);
+  else {
+    try { process.kill(r.pid, 'SIGTERM'); } catch {}
+    const until = Date.now() + 5000;
+    (function wait() {
+      if (!isDash(r.pid)) return console.log(`gh-dash: stopped for ${KEY} (pid ${r.pid})`);
+      if (Date.now() > until) {
+        console.error(`gh-dash: still running after 5 s (pid ${r.pid}); kill -9 ${r.pid} ends it without telling Greenhouse`);
+        process.exitCode = 1;
+        return;
+      }
+      setTimeout(wait, 100);
+    })();
+  }
 } else {
   const already = running();
   if (already) {
@@ -964,13 +1048,6 @@ if (ARGS.includes('--report-preview')) {
     })();
   } else {
     process.on('exit', cleanup);
-    // A clean stop tells Greenhouse (at most 3 s), so the machine's chats end at once.
-    const shutdown = () => {
-      rt.closing = true;
-      try { if (rt.ws) rt.ws.close(); } catch {}
-      setTimeout(() => process.exit(0), 3000);
-      void stopReport().finally(() => process.exit(0));
-    };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
     listen(BASE_PORT, 9);
@@ -1029,6 +1106,21 @@ const PAGE = String.raw`<!doctype html>
   .hint { min-height: 1.55em; margin-top: 3px; font-size: 11px; }
   .status { text-align: right; letter-spacing: .1em; font-size: 11px; }
   #clock { color: var(--hi); font-size: 20px; letter-spacing: .08em; font-variant-numeric: tabular-nums; }
+  /* Stopping (GH-136): muted until hovered or armed, then red. Green means healthy on this page. */
+  #stop, .stopc { font: inherit; color: var(--dim); background: none; cursor: pointer; }
+  #stop { margin-top: 4px; border: 1px solid var(--line2); padding: 0 7px; line-height: 18px; font-size: 11px; letter-spacing: .1em; text-transform: uppercase; }
+  #stop:not(:disabled):hover, #stop:focus-visible { color: var(--r); border-color: var(--r); outline: none; }
+  #stop:disabled { opacity: .35; cursor: default; }
+  .stopc { flex: none; display: inline-flex; align-items: center; gap: 4px; border: 0; padding: 0 2px; height: 16px; font-size: 10px; letter-spacing: .08em; }
+  .stopc svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 1.3; }
+  .stopc:not(:disabled):hover { color: var(--fg); }
+  .stopc:focus-visible { outline: 1px solid var(--line2); }
+  .stopc.armed { color: var(--r); }
+  .stopc.armed svg { fill: rgba(255, 95, 86, .25); }
+  .stopc:disabled { cursor: default; color: var(--a); }
+  .gone { border-color: var(--a); }
+  .gone .name { color: var(--a); }
+  .gone .body div { margin: 3px 0; }
 
   .alerts { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: 6px; margin: 14px 0 4px; }
   .tile { border: 1px solid var(--line2); background: var(--inset); color: var(--dim); text-align: center; padding: 8px 6px; font-size: 11px; letter-spacing: .16em; }
@@ -1169,13 +1261,14 @@ const PAGE = String.raw`<!doctype html>
   <div class="ident">
     <div class="cmd" id="cmd" title="type a ticket number to point the buttons at it (Esc clears)">$ <span id="key">gh</span>-<input id="tk" inputmode="numeric" autocomplete="off" spellcheck="false" aria-label="ticket number"><span class="cursor"></span></div>
     <div class="launch" id="launch">
-      <button data-kind="review"></button><button data-kind="fix"></button><button data-kind="merge"></button><button data-kind="work"></button><button data-kind="tend"></button>
+      <button data-kind="review"></button><button data-kind="fix"></button><button data-kind="merge"></button><button data-kind="work"></button><button data-kind="tend"></button><button data-kind="sow"></button>
     </div>
     <div class="modes" id="modes" title="how a start opens its chat"><span class="d">start in</span></div>
     <div class="hint" id="hint"></div>
   </div>
   <div class="gauges"><div class="gauge" id="m-cpu"></div><div class="gauge" id="m-mem"></div></div>
-  <div class="status"><div id="link" class="d">&#9679; CONNECTING</div><div id="gh" class="d">greenhouse</div><div id="clock">--:--:--</div></div>
+  <div class="status"><div id="link" class="d">&#9679; CONNECTING</div><div id="gh" class="d">greenhouse</div><div id="clock">--:--:--</div>
+    <div><button id="stop" title="stop gh-dash on this machine: its chats show as ended in Greenhouse and keep running">Stop</button></div></div>
 </div>
 
 <div class="alerts" id="alerts"></div>
@@ -1259,6 +1352,7 @@ function tag(lock) { return '<span class="tag ' + (starts(lock, 'slot') ? 'g' : 
 // The lamp shows what the chat needs first, then what gh-coord can see: waiting on a lock, running
 // under one, just claimed, or quiet (r.quiet, the same rule the report uses).
 function cardState(r) {
+  if (r.stopped) return ['s-quiet', 'STOPPED'];
   if (r.chat && r.chat.needs) return ['s-need', 'NEEDS YOU'];
   if (r.locks.some(function (l) { return starts(l, 'db-wait'); }) || starts(r.doing, 'waiting')) return ['s-wait', 'WAIT'];
   if (r.locks.indexOf('db') >= 0 || starts(r.doing, 'db')) return ['s-run', 'DB'];
@@ -1268,12 +1362,27 @@ function cardState(r) {
   return ['', 'IDLE'];
 }
 
+// An open chat's stop octagon (GH-136). The first click arms it for 3 s, the second sends the stop.
+// The armed and stopping cards live here, keyed by session id, and are part of the redraw key, so
+// the 2 s poll keeps them.
+var OCTAGON = '<svg viewBox="0 0 12 12" aria-hidden="true"><polygon points="4,.75 8,.75 11.25,4 11.25,8 8,11.25 4,11.25 .75,8 .75,4"/></svg>';
+var armed = null, armTimer = null, stopping = {};
+function stopButton(r) {
+  if (!r.chat || !r.chat.open) return '';
+  var id = esc(r.chat.id), name = esc(r.chat.name || r.ticket || r.label || 'chat');
+  if (stopping[r.chat.id]) return '<button class="stopc" disabled data-stop="' + id + '" aria-label="stopping ' + name + '">' + OCTAGON + '<span>stopping&hellip;</span></button>';
+  var on = armed === r.chat.id;
+  return '<button class="stopc' + (on ? ' armed' : '') + '" data-stop="' + id + '" data-name="' + name + '" aria-label="stop ' + name + (on ? '? press again to stop it' : '') + '" title="' +
+    (on ? 'click again to stop this chat' : 'stop this chat: two clicks; its claim and worktree stay') + '">' + OCTAGON + (on ? '<span>stop?</span>' : '') + '</button>';
+}
+
 function card(r, now) {
   var st = cardState(r), seen = r.chat ? now - r.chat.seen : null, quiet = r.quiet;
   var needs = r.chat && r.chat.needs ? NEEDS_TEXT[r.chat.needs] : '';
-  var doing = needs || r.doing || (quiet ? 'silent ' + ago(quiet) : '');
+  var doing = r.stopped ? 'stopped from gh-dash' : needs || r.doing || (quiet ? 'silent ' + ago(quiet) : '');
   var name = r.chat && r.chat.name;
-  var unclaim = quiet && !r.doing ? '<div class="card-fix" title="run this if the chat is gone">gh-coord unclaim ' + esc(r.ticket + ' ' + r.label) + '</div>' : '';
+  var unclaim = r.ticket && (r.stopped || (quiet && !r.doing))
+    ? '<div class="card-fix" title="' + (r.stopped ? 'the chat was stopped from here and still holds its claim' : 'run this if the chat is gone') + '">gh-coord unclaim ' + esc(r.ticket + ' ' + r.label) + '</div>' : '';
   var last = !r.ticket && r.chat && r.chat.lastTicket ? '<span>last ' + esc(r.chat.lastTicket) + '</span>' : '';
   var status = r.chat && r.chat.status ? '<span class="tag ' + (r.chat.status === 'busy' ? 'g' : 'd') + '">' + r.chat.status + '</span>' : '';
   var waited = needs && r.chat.needsSince ? ' &middot; waiting ' + ago(now - r.chat.needsSince) : '';
@@ -1284,9 +1393,9 @@ function card(r, now) {
   return '<div class="card ' + st[0] + '">' +
     '<div class="card-top"><i class="lamp"></i><b class="st">' + st[1] + '</b>' +
     '<span class="tk">' + esc(r.ticket || name || r.label || 'chat') + '</span>' +
-    '<span class="age" title="claimed this long ago">' + (r.claimed ? ago(now - r.claimed) : '') + '</span></div>' +
+    '<span class="age" title="claimed this long ago">' + (r.claimed ? ago(now - r.claimed) : '') + '</span>' + stopButton(r) + '</div>' +
     (r.ticket && name ? '<div class="card-name" title="chat name">' + esc(name) + '</div>' : '') +
-    (doing ? '<div class="card-do' + (needs ? ' a' : r.doing ? '' : ' d') + '" title="' + esc(doing) + '">' + esc(doing) + waited + '</div>' : '') + loop + unclaim +
+    (doing ? '<div class="card-do' + (needs || r.stopped ? ' a' : r.doing ? '' : ' d') + '" title="' + esc(doing) + '">' + esc(doing) + waited + '</div>' : '') + loop + unclaim +
     '<div class="card-meta">' + status + r.locks.map(tag).join('') + last + '<span>' + esc(base(r.worktree)) + '</span>' +
     '<span title="last gh-coord call from this chat">seen ' + (seen == null ? '-' : ago(seen)) + '</span></div>' +
     '</div>';
@@ -1294,6 +1403,8 @@ function card(r, now) {
 
 function renderStages(s) {
   var by = { idle: [], work: [], review: [], fix: [], merge: [] };
+  // A stop octagon armed from the keyboard keeps focus across the redraw, so Enter can confirm it.
+  var focused = document.activeElement && document.activeElement.getAttribute && document.activeElement.getAttribute('data-stop');
   s.rows.forEach(function (r) { by[r.ticket && ROLES.indexOf(r.role) >= 0 ? r.role : 'idle'].push(r); });
   Object.keys(by).forEach(function (k) {
     var el = $('st-' + k), list = by[k];
@@ -1303,6 +1414,9 @@ function renderStages(s) {
       ? list.map(function (r) { return card(r, s.now); }).join('')
       : '<div class="empty">none</div>';
   });
+  if (focused) {
+    [].forEach.call(document.querySelectorAll('[data-stop]'), function (b) { if (b.getAttribute('data-stop') === focused) b.focus(); });
+  }
   var merged = s.dev.merged, el = $('st-dev');
   $('base-name').textContent = s.base;
   el.classList.toggle('live', merged.length > 0);
@@ -1454,7 +1568,7 @@ function renderGreenhouse(s) {
   else if (g.state === 'error') { el.className = 'r'; el.textContent = 'GREENHOUSE ERROR'; }
   else { el.className = 'd'; el.textContent = 'GREENHOUSE ...'; }
   el.title = g.error || (g.state === 'reporting' ? 'reports this machine\'s chats when they change (last ' + ago(s.now - g.lastSent) + ' ago); ' +
-    (g.live ? 'starts from ticket pages arrive at once' : 'checking for starts every minute (no realtime connection)') : '');
+    (g.live ? 'starts from Greenhouse arrive at once' : 'checking for starts every minute (no realtime connection)') : '');
 }
 
 // The start buttons and the mode switch.
@@ -1513,13 +1627,15 @@ $('modes').addEventListener('click', function (e) {
     .then(function (o) { if (o.error) hint('r', o.error); else { modesKey = ''; hint('d', 'starts now open in ' + o.mode + ' mode, Greenhouse\'s included'); tick(); } });
 });
 // The buttons say what a click starts: with a number, one pass of the skill on that ticket; without
-// one, a numbered loop for review, fix and merge, and work picks the next tended ticket.
+// one, a numbered loop for review, fix and merge, and work picks the next tended ticket. sow ignores
+// the number: sow-feedback asks which notes to sow.
 var nextNames = {};
 var SKILL_OF = { work: 'work-ticket', fix: 'fix-review-feedback', review: 'review-pr', merge: 'merge-pr' };
 function labelStarts() {
   var n = $('tk').value.replace(/\D/g, '');
-  ['review', 'fix', 'merge', 'work', 'tend'].forEach(function (k) {
+  ['review', 'fix', 'merge', 'work', 'tend', 'sow'].forEach(function (k) {
     var b = document.querySelector('[data-kind="' + k + '"]'), loop = LOOPS.indexOf(k) >= 0;
+    if (k === 'sow') { b.textContent = 'sow'; b.title = 'new chat ' + key + '-sow running /greenhouse:sow-feedback'; return; }
     b.textContent = k + ' ' + (n || (loop ? 'loop' : k === 'work' ? 'next' : ''));
     b.disabled = k === 'tend' && !n;
     b.title = n
@@ -1546,11 +1662,57 @@ function renderStarts(s) {
   nextNames = s.starts; labelStarts();
 }
 
-var lastKey = '', lastDraw = 0;
+// Stopping (GH-136). A card's octagon: the first click (or Enter/Space) arms it for 3 s, a second
+// click sends the stop; 3 s, Esc or arming another card disarms it. Each change redraws at once.
+function redraw() { if (lastState && !dashStopped) render(lastState); }
+function disarm() { clearTimeout(armTimer); if (armed) { armed = null; redraw(); } }
+function arm(id) { clearTimeout(armTimer); armed = id; armTimer = setTimeout(disarm, 3000); redraw(); }
+function stopChat(id, name) {
+  clearTimeout(armTimer); armed = null; stopping[id] = true; redraw();
+  post('/api/stop-chat', { session: id })
+    .then(function (o) { if (o.error) hint('r', o.error); else hint('g', name + ' stopped'); })
+    .catch(function () { hint('r', 'gh-dash is not answering'); })
+    .then(tick)
+    .then(function () { delete stopping[id]; redraw(); });
+}
+document.querySelector('.mimic').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-stop]');
+  if (!b || b.disabled) return;
+  var id = b.getAttribute('data-stop');
+  if (armed === id) stopChat(id, b.getAttribute('data-name'));
+  else arm(id);
+});
+document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && armed) disarm(); });
+
+// The header's Stop ends gh-dash itself. Greenhouse shows this machine's chats as ended; the chats
+// keep running. Once it has said yes, polling stops and the stages say how to start it again.
+var poller = null, dashStopped = false;
+$('stop').addEventListener('click', function () {
+  var n = lastState ? lastState.rows.filter(function (r) { return r.chat && r.chat.open; }).length : 0;
+  var ask = 'Stop gh-dash for ' + key + '?' + (n > 0
+    ? '\n\n' + n + ' open ' + (n === 1 ? 'chat' : 'chats') + ' on this machine will show as ended in Greenhouse. The chats themselves keep running.' : '');
+  if (!confirm(ask)) return;
+  post('/api/stop', {})
+    .then(function (o) { if (!o.stopping) throw new Error('refused'); showStopped(); })
+    .catch(function () { hint('r', 'gh-dash is not answering'); });
+});
+function showStopped() {
+  dashStopped = true;
+  clearInterval(poller);
+  clearTimeout(armTimer); armed = null;
+  $('stop').disabled = true;
+  $('link').className = 'a'; $('link').textContent = '● STOPPED';
+  document.querySelector('.mimic').outerHTML = '<section class="panel gone"><header><span class="desig">--</span><span class="name">gh-dash stopped</span></header>' +
+    '<div class="body"><div>from a Claude Code chat in this repo:</div><div class="g">! gh-dash --detach --open</div>' +
+    '<div class="d">reload this page once it\'s running</div></div></section>';
+  document.title = 'gh-dash ' + key + ' (stopped)';
+}
+
+var lastKey = '', lastDraw = 0, lastState = null;
 function render(s) {
   renderStarts(s); renderModes(s); renderAlerts(s); renderMachine(s); renderGreenhouse(s);
   // Redraw on change, or every 10s for the ages, so a text selection survives between polls.
-  var k = JSON.stringify([s.rows, s.db, s.waiting, s.heavy, s.stack, s.stackDown, s.awake, s.dev, s.flows, s.log[0]]);
+  var k = JSON.stringify([armed, Object.keys(stopping), s.rows, s.db, s.waiting, s.heavy, s.stack, s.stackDown, s.awake, s.dev, s.flows, s.log[0]]);
   if (k === lastKey && Date.now() - lastDraw < 10000) return;
   lastKey = k; lastDraw = Date.now();
   renderStages(s); renderFlows(s); renderLocks(s); renderTimeline(s); renderLog(s);
@@ -1558,15 +1720,17 @@ function render(s) {
   document.title = (needing ? '(' + needing + ' need you) ' : s.waiting.length ? '(' + s.waiting.length + ' db-wait) ' : '') + 'gh-dash ' + key;
 }
 
+// A poll still in flight when the page stopped gh-dash is dropped.
 function tick() {
-  fetch('/api/state', { cache: 'no-store' })
+  if (dashStopped) return;
+  return fetch('/api/state', { cache: 'no-store' })
     .then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); })
-    .then(function (s) { render(s); $('link').className = 'g'; $('link').textContent = '● CONNECTED'; })
-    .catch(function () { $('link').className = 'r'; $('link').textContent = '● DISCONNECTED'; });
+    .then(function (s) { if (dashStopped) return; lastState = s; render(s); $('link').className = 'g'; $('link').textContent = '● CONNECTED'; })
+    .catch(function () { if (dashStopped) return; $('link').className = 'r'; $('link').textContent = '● DISCONNECTED'; });
 }
 function clock() { $('clock').textContent = new Date().toLocaleTimeString([], { hour12: false }); }
 tick(); clock();
-setInterval(tick, 2000);
+poller = setInterval(tick, 2000);
 setInterval(clock, 1000);
 </script>
 </body>

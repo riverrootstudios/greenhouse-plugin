@@ -12,7 +12,7 @@ Works in Claude Code (CLI, IDE extensions, desktop Code tab). The skills run she
 
 ## Accounts
 
-Greenhouse accounts are **invite-only**. An admin of your Greenhouse organization invites you from the web app; there is no self-service signup. Once you're in, you generate your own CLI token — see [Getting started](#getting-started).
+There are two ways in. To **join an organization**, an admin there invites you from the web app. To **start an organization**, you need a signup code from RiverRoot Studios: open the signup link, name your organization, and you own it. There is no signup without one or the other. Once you're in, you generate your own CLI token — see [Getting started](#getting-started).
 
 ---
 
@@ -55,7 +55,7 @@ Project config is embedded directly in the project's `CLAUDE.md` (committed to g
 
 Connection values resolve automatically: `GREENHOUSE_URL` and `GREENHOUSE_PUBLIC_KEY` (both non-secret — the same values the web app ships to every browser) come with the plugin; your personal `GREENHOUSE_API_KEY` lands in `~/.greenhouse/config` when you run `/greenhouse:setup`. An environment variable always overrides both (handy for one-shot org switching).
 
-Add the config block by hand when adopting a project — [templates/greenhouse/claude.md.template](templates/greenhouse/claude.md.template) has the full section — and run `/greenhouse:health-check` to verify or repair it.
+The web app's project page has a **Connect a repo** card with the config block and the `.claude/settings.json` above, ready to copy. To write it by hand, [templates/greenhouse/claude.md.template](templates/greenhouse/claude.md.template) has the full section. Either way, run `/greenhouse:health-check` to verify or repair it.
 
 ### Prerequisites
 
@@ -210,7 +210,7 @@ It keeps running after the chat or terminal closes, and every `--agent` run star
 
 Starts open in whatever mode the dashboard is set to (Terminal, VS Code or background; see [Starting chats](#starting-chats)), including starts from Greenhouse. Terminal uses iTerm when `GREENHOUSE_TERMINAL=iterm` is set in your shell profile. VS Code starts open with the command typed in and need Enter.
 
-**While gh-dash runs, Greenhouse can see this machine.** It reports only when something changes (there's no heartbeat), so a quiet machine costs nothing. Stop it and its chats end at once; if the machine sleeps or crashes, it shows offline after 10 minutes. A chat closed while it still holds a ticket ends an hour after its last `gh-coord` call (the dashboard offers the `gh-coord unclaim` line). Ticket status is unaffected either way, because the skills write that themselves. `gh-dash --report-preview` prints exactly what it sends: per chat its session id, name, ticket, role, what it's doing, needs-you and since when, when its loop last ticked and is next due, folder name and start time; per machine its heavy slots (how many, who holds each and what it runs), the DB lock and who's waiting, the stack and its start mode. Never transcript or prompt text, file contents, env values, CPU or memory, process lists or full paths. CPU, memory and busy/idle stay on the local page.
+**While gh-dash runs, Greenhouse can see this machine.** It reports only when something changes (there's no heartbeat), so a quiet machine costs nothing. Stop it and its chats end at once in Greenhouse (the chats themselves keep running): use the **Stop** button in the page's header, or `gh-dash --stop`, which stops only this repo's dashboard and says so when none is running. If gh-dash is still up 5 s after `--stop`, it prints the pid and a `kill -9` line rather than forcing it, because a forced kill can't tell Greenhouse. If the machine sleeps or crashes, it shows offline after 10 minutes. To end a single chat, click the octagon at the right of its card twice within 3 s. gh-dash sends that chat SIGTERM (never SIGKILL) and it ends in Greenhouse at once. Its claim and worktree stay: a claimed card reads *stopped from gh-dash* with the `gh-coord unclaim` line, and an unclaimed card leaves the page. A chat closed while it still holds a ticket ends an hour after its last `gh-coord` call (the dashboard offers the `gh-coord unclaim` line). Ticket status is unaffected either way, because the skills write that themselves. `gh-dash --report-preview` prints exactly what it sends: per chat its session id, name, ticket, role, what it's doing, needs-you and since when, when its loop last ticked and is next due, folder name and start time; per machine its heavy slots (how many, who holds each and what it runs), the DB lock and who's waiting, the stack and its start mode. Never transcript or prompt text, file contents, env values, CPU or memory, process lists or full paths. CPU, memory and busy/idle stay on the local page.
 
 ### Starting chats
 

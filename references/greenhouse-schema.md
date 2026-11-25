@@ -73,6 +73,7 @@ All data tables include an `org_id` column (UUID, NOT NULL, FK → organizations
 | repository_url | TEXT | no | — | GitHub repo URL |
 | next_ticket_number | INTEGER | yes | 1 | Atomic counter (managed by `create_ticket`) |
 | org_id | UUID | yes | — | FK → organizations |
+| dependency_owner | TEXT | no | — | `team_username` of whoever reviews and merges the project's Dependabot PRs: assignee and reviewer of the tickets PR sync files for them; NULL = filed unassigned (GH-135). Org admins and owners only (42501), and only a member of the project's org (22023) — `trg_guard_dependency_owner`. Set in Project settings |
 | archived_at | TIMESTAMPTZ | no | — | Soft delete |
 | created_at | TIMESTAMPTZ | yes | now() | |
 | updated_at | TIMESTAMPTZ | yes | now() | Auto-updated by trigger |
@@ -136,6 +137,7 @@ The core table. Everything revolves around this.
 | compliance_tags | TEXT[] | no | — | `'{soc2,iec_62304}'` |
 | branch_name | TEXT | no | — | Git branch |
 | pr_url | TEXT | no | — | GitHub PR URL |
+| source_pr_url | TEXT | no, unique | — | The PR this ticket was filed for by PR sync (`file_dependency_ticket`, GH-135): a Dependabot PR has no `Implements` line, so it's linked through this. Set by nothing else. `pr_url` can't carry the unique index: several tickets may share one |
 | files_changed | TEXT | no | — | Key files touched |
 | ai_implemented | BOOLEAN | yes | false | Set by `work-ticket` |
 | org_id | UUID | yes | — | FK → organizations (inferred from project by `create_ticket`) |
@@ -243,11 +245,11 @@ One row per **open** GitHub pull request (GH-88), the collection every ticket su
 | requested_reviewer_login | TEXT | no | — | Derivation input |
 | latest_review_state / _login / _commit_id | TEXT | no | — | Derivation inputs: the latest non-COMMENTED review. Storing them is what lets a webhook event re-derive the stage with no GitHub call |
 | stage | pr_stage | yes | — | Derived |
-| up_next_login | TEXT | yes | — | Derived — the GitHub login on the hook |
+| up_next_login | TEXT | yes | — | Derived — the GitHub login on the hook. On a Dependabot PR, wherever the author would be up next it's the ticket assignee's `github_login` (the bot when there's none); `author_login` stays the bot |
 | checks_state | pr_checks_state | yes | `none` | From GitHub's `mergeable_state`, read alongside review state |
 | mergeable_state | TEXT | no | — | GitHub's raw value, for context |
 | comments_count | INTEGER | yes | 0 | |
-| ticket_id | UUID | no | — | FK → tickets (SET NULL); the ticket named by `Implements GH-N` in the PR body |
+| ticket_id | UUID | no | — | FK → tickets (SET NULL); the ticket named by `Implements GH-N` in the PR body, else (a Dependabot PR) the one whose `source_pr_url` is this PR |
 | project_id | UUID | no | — | FK → projects; the project whose `repository_url` names the repo. NULL when none does |
 | org_id | UUID | yes | — | FK → organizations. Unmatched repos take the single GitHub-connected org |
 | pr_updated_at | TIMESTAMPTZ | yes | — | GitHub's `updated_at` |
@@ -258,6 +260,8 @@ One row per **open** GitHub pull request (GH-88), the collection every ticket su
 **RLS:** SELECT only, the tickets shape — `org_id = get_user_org_id() AND (is_org_admin_or_owner() OR (project_id IS NOT NULL AND user_has_project_access(project_id)))`. Members see PRs for projects they have been granted; owners/admins see the whole org, including NULL-project rows.
 
 **Sync (web app):** `/api/cron/sync-pull-requests` runs every 5 minutes (`web/vercel.json`) as the reconciler — one pass per (Greenhouse org, GitHub owner) connection that a project's `repository_url` makes, each with that org's own token (see [github_connections](#github_connections)), over the owner's 100 most recently updated open and merged PRs. A connection writes, back-syncs and deletes only its own org's rows and tickets; a repo that projects in two orgs point at is skipped. A connection with no token is skipped and a failed search writes nothing for it; a row is deleted only when its connection's successful pass did not see the PR open (and nothing for a connection whose open search fills its page); the `in_review → harvest` transition runs only for a merge newer than that connection's previous pass, so a ticket reopened after its PR merged is not re-harvested. `/api/webhooks/github` is the fast path — an org-level hook in each GitHub org, subscribed to Pull requests, Pull request reviews, Check suites and Statuses, verified by HMAC over the raw body (one shared `GITHUB_WEBHOOK_SECRET`), answering 200 once verified because GitHub does not retry. A change to `stage`, `up_next_login` or `checks_state` broadcasts a contentless `pr-state` event on each open `board:{id}` channel; boards refetch through their own RLS-scoped poll. `/api/github-prs` (the Home widget) reads this table and makes no GitHub calls.
+
+**Dependabot PRs (GH-135):** a PR authored by `dependabot[bot]` with no `Implements` line, in a repo scoped to a project, links to the ticket filed for it (`tickets.source_pr_url`), and both paths file one through `file_dependency_ticket` when there's none. Merged harvests it like any ticket. Closed unmerged weeds it, with a `system` comment naming who closed it (webhook) and quoting Dependabot's "Superseded by #N" comment; the reconciler, whose searches see only open and merged PRs, reads the PR once before weeding a row in neither, and keeps the row when that read fails (a 404 drops it, and leaves its ticket as it is). A webhook `reopened` puts a weeded one back to `in_review`. Weed and restore go through `move_dependency_ticket`, so the status change and its comment land together. All of these writes carry `last_edited_source: "preserve"`.
 
 **Plugin:** read-only for skills. `GET /rest/v1/pull_requests?ticket_id=eq.{uuid}` shows a ticket's open PR state; skills never write here.
 
@@ -511,6 +515,34 @@ POST /rest/v1/rpc/create_ticket
 ```
 
 Auto-logs creation to `activity_log`.
+
+---
+
+### file_dependency_ticket
+
+PR sync's filing path for Dependabot PRs (GH-135). **Service role only**: authenticated callers get 42501, so skills never call it.
+
+```
+POST /rest/v1/rpc/file_dependency_ticket
+{"p_project_id": "uuid", "p_pr_url": "https://github.com/org/repo/pull/12", "p_title": "Bump next from 15.1.0 to 15.2.1", "p_description": "..."}
+```
+
+Under `pg_advisory_xact_lock(hashtext(p_pr_url))`, returns the ticket whose `source_pr_url` is the PR, or files one: type `chore`, priority `p3_low`, labels `{dependencies}`, complexity `1`, status `in_review`, `pr_url` and `source_pr_url` = the PR, assignee and reviewer = the project's `dependency_owner`, `created_by` `system`. A race files no second ticket and takes no second number.
+
+**Returns:** `{"id": "uuid", "display_id": "ROOTS-1200", "assignee": "dan", "status": "in_review", "created": true}` (`created` is false when the ticket already existed).
+
+**Plugin:** a Dependabot PR's ticket is `GET /rest/v1/tickets?source_pr_url=eq.{pr url}` (merge-pr, review-pr and their agent loops).
+
+### move_dependency_ticket
+
+PR sync's weed and restore for the tickets `file_dependency_ticket` filed (GH-135). **Service role only** (42501 otherwise), so skills never call it.
+
+```
+POST /rest/v1/rpc/move_dependency_ticket
+{"p_ticket_id": "uuid", "p_to": "weeded", "p_comment": "Dependabot PR closed without merging by @mb-owl: …"}
+```
+
+Moves a ticket with a `source_pr_url` to `weeded` (unless it's `harvest` or already `weeded`) or back to `in_review` (only from `weeded`), and posts `p_comment` as `system`, in one transaction. `updated_by` becomes `system`. **Returns:** `true` when it moved the ticket, `false` when the guard matched nothing (no comment then). Any other `p_to` is 22023.
 
 ---
 

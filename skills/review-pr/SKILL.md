@@ -70,7 +70,7 @@ ${CLAUDE_PLUGIN_ROOT}/bin/gh-heartbeat
 
 **If PR number provided:**
 ```bash
-gh pr view {number} --json state,isDraft,mergedAt,mergeCommit,closedAt,title,body,number,author,headRefName,headRefOid,baseRefName,files,additions,deletions,reviews,reviewDecision,statusCheckRollup,mergeable
+gh pr view {number} --json state,isDraft,mergedAt,mergeCommit,closedAt,title,body,number,url,author,headRefName,headRefOid,baseRefName,files,additions,deletions,reviews,reviewDecision,statusCheckRollup,mergeable
 ```
 
 **If no PR number:**
@@ -83,7 +83,18 @@ Pick the oldest awaiting review, or ask in a box ([common-operations §Asking th
 
 **Gate — CI on the current head:** run [CI on the Current Head](../../references/common-operations.md#ci-on-the-current-head) — compare `headRefOid` with the latest completed run's `headSha` rather than trusting `gh pr checks`. A `CONFLICTING` PR or a SHA mismatch reports CI as **unverified** and becomes a blocking `[REQUIRED]` finding naming both SHAs and the run id — never "passing".
 
-Parse PR description for `Implements {TICKET-ID}`. If not found, say *"This PR doesn't reference a Greenhouse ticket."* and ask in a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), header `PR #{number}`:
+Parse PR description for `Implements {TICKET-ID}`.
+
+**No `Implements` line, bot author** (`author.login` is `app/dependabot`, `author.is_bot` is `true`): it's a Dependabot PR (GH-135). Greenhouse files its ticket itself, so never offer **Create ticket now**. The ticket is the one with this PR as its `source_pr_url`:
+
+```bash
+curl -s "${GREENHOUSE_URL}/rest/v1/tickets?source_pr_url=eq.{url}&select=display_id,status,assignee,reviewer" \
+  -H "apikey: ${GREENHOUSE_PUBLIC_KEY}" -H "Authorization: Bearer ${GREENHOUSE_JWT}"
+```
+
+`{url}` is the PR's `url`, exactly as `gh` prints it. Found → resolve that `display_id` below and review as usual, with the Dependabot gate in 3c. No row yet → *"Greenhouse files a ticket for this Dependabot PR within 5 minutes of seeing it. Review it then."* and stop.
+
+Any other PR without an `Implements` line: say *"This PR doesn't reference a Greenhouse ticket."* and ask in a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)), header `PR #{number}`:
 
 1. **Provide ticket ID** — if one already exists (typed in the free text)
 2. **Create ticket now** — I'll create one from the PR context
@@ -251,15 +262,19 @@ Then one box, one question per finding (up to 4; more go in a second box), heade
 
 Outside that one case the classification determines the verdict. The user's other input happened in 3a (escalation) where they helped classify ambiguous items.
 
+**Dependabot PR:** the verdict is **Approve** or **Close**, never request changes and never merge conditions. Nobody fixes a Dependabot PR on its branch (Dependabot stops maintaining a PR once someone else pushes to it), so a problem is a reason to close it, and a hand upgrade is a new ticket. Ask in a box, header `{TICKET-ID}`, question `{TICKET-ID}: approve or close Dependabot PR #{number}?`:
+- **Approve**: recommended when nothing would block a human's PR. `[NOTED]` items and any minor `[REQUIRED]` ones go in the approval body as notes.
+- **Close**: recommended when something would block it (a failing build, a breaking upgrade the code doesn't handle). Its reason is the blocking findings, one line each.
+
 ### 3d: Confirm before posting (HARD GATE)
 
 The verdict follows from the findings, but **posting it to GitHub + Greenhouse is gated on explicit user confirmation**. Do not call `gh pr review` or PATCH the ticket until the user gives a go-ahead in this exchange.
 
-Print the verdict line, then a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): header `{TICKET-ID}`, question `{TICKET-ID}: post {APPROVE | APPROVE with {N} merge conditions | REQUEST_CHANGES} on PR #{number}?` ({N} required, {M} noted on the line above), options **Post it** (recommended) and **Walk me through a section first** (they name it in the free text).
+Print the verdict line, then a confirm box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)): header `{TICKET-ID}`, question `{TICKET-ID}: post {APPROVE | APPROVE with {N} merge conditions | REQUEST_CHANGES | CLOSE} on PR #{number}?` ({N} required, {M} noted on the line above), options **Post it** (recommended) and **Walk me through a section first** (they name it in the free text).
 
 Only **Post it** (or an equivalent typed go-ahead: `post`, `ship it`, `yes`, `lgtm`) posts. Anything else — questions, "walk me through X", "let me think", a box that comes back unanswered — pauses posting. Address what was asked, then ask again in a fresh box.
 
-This gate applies whether the verdict is APPROVE or REQUEST_CHANGES. Never post a review verdict on the same turn it was drafted unless the user explicitly said to.
+This gate applies whether the verdict is APPROVE, REQUEST_CHANGES or a Dependabot PR's CLOSE. Never post a review verdict on the same turn it was drafted unless the user explicitly said to.
 
 ### 3e: Post the verdict
 
@@ -285,6 +300,20 @@ gh pr review {number} --approve --body "Approved with merge conditions.
 ```
 > "Approved with {N} merge conditions — @{author}, `/greenhouse:merge-pr {number}` will list them and ask you to confirm before merging."
 
+**Dependabot PR, approve:**
+```bash
+gh pr review {number} --approve --body "Looks good! {notes: [NOTED] and minor findings}"
+```
+> "Approved ✅ — {assignee} lands it with `/greenhouse:merge-pr {number}`."
+
+When the ticket has no assignee: *"Approved ✅ — assign {TICKET-ID} first (the project's dependency owner, in Project settings), then they land it with `/greenhouse:merge-pr {number}`."*
+
+**Dependabot PR, close:**
+```bash
+gh pr close {number} --comment "{reason}"
+```
+Post the same reason on the ticket (`POST /rest/v1/comments`, `author` `${GREENHOUSE_TEAM_USERNAME}`, `org_id` `${GREENHOUSE_ORG_ID}`). PR sync weeds the ticket when it sees the close. Then a confirm box, header `{TICKET-ID}`, question `{TICKET-ID}: file a ticket to do this upgrade by hand?`, options **No** (recommended) and **File it**. Only **File it** runs `/greenhouse:create-ticket`, with the reason and the PR link as its context.
+
 **If request changes (any required findings):**
 ```bash
 gh pr review {number} --request-changes --body "{structured list of [REQUIRED] findings with File/Issue/Fix}"
@@ -305,7 +334,9 @@ Then stop. The author addresses feedback with `/greenhouse:fix-review-feedback` 
 
 | Error | Action |
 |-------|--------|
-| PR doesn't reference a ticket | Offer the three options in Step 1 (provide ID / create / skip) |
+| PR doesn't reference a ticket | Offer the three options in Step 1 (provide ID / create / skip). Never for a Dependabot PR |
+| Dependabot PR, no ticket yet | Say sync files one within 5 minutes, stop (Step 1) |
+| Dependabot PR with blocking findings | Close it (3c), never request changes |
 | Compliance check fails (compliance-tagged ticket) | Report failures in findings as `[REQUIRED]` |
 | CI failing | Note in findings; a red build is a `[REQUIRED]` finding, not a merge concern here |
 | CI unverified (`CONFLICTING`, or last run's `headSha` ≠ PR head) | `[REQUIRED]` finding naming both SHAs and the run id — never report CI as passing |

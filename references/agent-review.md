@@ -20,6 +20,7 @@ Run under `/loop` (`/loop 5m /greenhouse:review-pr --agent`, or `/loop /greenhou
    `GET /rest/v1/tickets?project_id=eq.$GREENHOUSE_PROJECT_ID&status=eq.in_review&or=(reviewer.in.($ALIASES),reviewer.is.null)&select=id,display_id,title,pr_url,reviewer,assignee,updated_at&order=updated_at.asc`
    - `reviewer` null → keep it only if `gh pr view <n> --json reviewRequests` requests `$GH_ME`. A null reviewer is never assumed mine.
    - Skip PRs authored by `$GH_ME`.
+   - Dependabot PRs come through this same query (GH-135): PR sync files their tickets with the project's dependency owner as `reviewer`, and `pr_url` set to the PR.
 3. For each candidate, read `gh pr view <n> --json headRefOid,state,baseRefName,mergeStateStatus,reviews,reviewRequests,isDraft` and the ticket's latest `gh-loop review` comment (see §4). Skip when:
    - the PR isn't OPEN, or is a draft;
    - that comment records this head sha as posted;
@@ -39,6 +40,8 @@ Run under `/loop` (`/loop 5m /greenhouse:review-pr --agent`, or `/loop /greenhou
 ## 3. Post, then ask
 
 The tick does all of its person-free work first, then asks, then waits.
+
+**A Dependabot PR** gets review-pr's Dependabot gate (Approve or Close, never request changes, never merge conditions). **Approve** is person-free: post it like any clean verdict in step 1. **Close** is always a judgment item for the box: closing ends the upgrade, and only a person says whether to file a hand-upgrade ticket. Its brief names the blocking findings, and the box asks close or approve with notes. On a close, review-pr's own follow-up box (file a hand-upgrade ticket?) waits for its answer too.
 
 1. **No judgment items:** `--agent` is the user's go-ahead for review-pr's posting gate. Post the verdict (APPROVE, APPROVE with merge conditions, or REQUEST_CHANGES), record it (§4), and `GC unclaim $KEY-{n} $KEY-{n}/review`. Go on to the next PR.
 2. **Judgment items** (review-pr's Step 2f): hold this PR's verdict and keep its claim. Post one PR comment for the round, so the author can see why no verdict came: `Review r{N} at {short sha} is waiting on {user}'s decision: {one line}.` A PR left for this tick by an earlier one (step 3) already has it: when `gh pr view <n> --json comments` shows a comment starting `Review r{N} at {short sha} is waiting`, don't post another. Then go on to the next PR.

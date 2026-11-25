@@ -1,5 +1,5 @@
 ---
-description: Squash-merge an approved PR you authored, clean up branches, and harvest the ticket in Greenhouse. Author-only — hands off if you didn't open the PR. Use when merging or landing an approved PR. With --agent, runs one merge tick for /loop that applies merge conditions, waits for every CI job, and lands your approved PRs.
+description: Squash-merge an approved PR you authored, clean up branches, and harvest the ticket in Greenhouse. Author-only — hands off if you didn't open the PR (a Dependabot PR is landed by its ticket's assignee). Use when merging or landing an approved PR. With --agent, runs one merge tick for /loop that applies merge conditions, waits for every CI job, and lands your approved PRs.
 argument-hint: "[pr-number] [--agent [dry]]"
 ---
 
@@ -9,6 +9,10 @@ Lands an already-approved PR. Split out from `review-pr` so the **author owns th
 merge** — the reviewer reviews, the author merges their own change. This skill
 never reviews; it gates on approval + CI + author identity, then squash-merges,
 cleans up, and harvests the ticket.
+
+**Dependabot PRs (GH-135)** have no human author, so the project's dependency owner
+lands them. Greenhouse files each one a ticket (`source_pr_url` = the PR), assigned to
+that owner, and the ticket's assignee stands in for the author at every step below.
 
 ---
 
@@ -44,18 +48,37 @@ ${CLAUDE_PLUGIN_ROOT}/bin/gh-heartbeat
 
 **If PR number provided:**
 ```bash
-gh pr view {number} --json title,number,author,headRefName,baseRefName,reviewDecision,mergeable,body
+gh pr view {number} --json title,number,url,author,headRefName,baseRefName,reviewDecision,mergeable,body
 ```
 
 **If no PR number:** list your own open, approved PRs and pick, or ask in a box ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)) with them as options.
 
 Parse the PR body for `Implements {TICKET-ID}` and resolve via Resolve Ticket Context in [references/common-operations.md](../../references/common-operations.md).
 
+**No `Implements` line, bot author** (`author.login` is `app/dependabot`, `author.is_bot` is `true`): it's a Dependabot PR. Its ticket is the one PR sync filed for it:
+
+```bash
+curl -s "${GREENHOUSE_URL}/rest/v1/tickets?source_pr_url=eq.{url}&select=id,display_id,title,status,assignee,reviewer,type" \
+  -H "apikey: ${GREENHOUSE_PUBLIC_KEY}" -H "Authorization: Bearer ${GREENHOUSE_JWT}"
+```
+
+`{url}` is the PR's `url`, exactly as `gh` prints it. Then resolve that `display_id` as above. No row yet → *"Greenhouse files a ticket for this Dependabot PR within 5 minutes of seeing it. Try again then."* and stop.
+
 ---
 
 ## Step 2: Author Gate (HARD GATE)
 
-The author lands their own PR. Ask GitHub whether you opened it — `@me` is resolved by GitHub from your `gh` auth, so no login is looked up locally:
+The author lands their own PR.
+
+**Dependabot PR (Step 1 found it by `source_pr_url`):** skip the `@me` check below — the bot is the author, so this gate is the ticket's assignee instead. It passes when `assignee` is `${GREENHOUSE_TEAM_USERNAME}`. Otherwise stop:
+
+> "PR #{number} is a Dependabot PR assigned to {assignee}. They land it with `/greenhouse:merge-pr {number}`."
+
+With no assignee:
+
+> "PR #{number} is a Dependabot PR whose ticket {TICKET-ID} has no assignee. Assign it first (the project's dependency owner is in Project settings), then run this again."
+
+**Every other PR** stays author-only. Ask GitHub whether you opened it — `@me` is resolved by GitHub from your `gh` auth, so no login is looked up locally:
 
 ```bash
 gh pr view {number} --json author --jq .author.login     # PR author, for the message below
@@ -101,6 +124,10 @@ Stop.
 
 The target branch is the PR's `baseRefName` (rung 2 of [Resolve Base Branch](../../references/common-operations.md#resolve-base-branch)) — whatever open-pr set, including an epic branch.
 
+**Dependabot PR:** its base must be the integration branch (rungs 4–5 of [Resolve Base Branch](../../references/common-operations.md#resolve-base-branch)). Otherwise stop:
+
+> "PR #{number} targets {baseRefName}, but ticket PRs land on {integration-branch}. Set `target-branch: {integration-branch}` for this ecosystem in `.github/dependabot.yml`; Dependabot opens its next PRs there. Close this one with `/greenhouse:review-pr {number}`, or retarget it by hand."
+
 With every gate passed, confirm ([common-operations §Asking the User](../../references/common-operations.md#asking-the-user)). The context line:
 
 > "PR #{number} is approved and CI passed on the current head ({short-sha})."
@@ -119,6 +146,13 @@ gh pr merge {number} --squash --subject "{type}: {description} [{ticket-id}]"
 ```
 
 Type derived from ticket type: feature → `feat`, bug → `fix`, chore → `chore`, infrastructure → `ci`, tech_debt → `refactor`, hotfix → `hotfix`, spike → `chore`.
+
+**Dependabot PR:** the subject is `chore: {description} [{ticket-id}]`, where `{description}` is the PR title with any leading `type(scope): ` or `type: ` removed and its first letter lowercased:
+
+| PR title | Subject |
+|----------|---------|
+| Bump the npm-minor-and-patch group with 9 updates | `chore: bump the npm-minor-and-patch group with 9 updates [ROOTS-1200]` |
+| chore(deps): bump next from 15.1.0 to 15.2.1 | `chore: bump next from 15.1.0 to 15.2.1 [ROOTS-1201]` |
 
 Capture the merge commit SHA.
 
@@ -140,6 +174,8 @@ git branch -d {branch-name}              # local
 git checkout {target-branch}
 git pull origin {target-branch}
 ```
+
+**Dependabot PR:** skip both deletes. The `dependabot/*` branch is Dependabot's, and there's no local copy. Still check out and pull `{target-branch}`.
 
 Verify the merge commit is present: `git log --oneline -1`
 
@@ -238,6 +274,9 @@ Pick up next ticket? ({next-ticket-id}: {title}) or tell me what's next.
 | Error | Action |
 |-------|--------|
 | Runner is not the PR author | Stop, hand off to author (Step 2) |
+| Dependabot PR, runner is not the ticket's assignee | Stop, name the assignee, or say to assign the ticket first (Step 2) |
+| Dependabot PR, no ticket yet | Stop: sync files one within 5 minutes (Step 1) |
+| Dependabot PR not based on the integration branch | Stop, hint `target-branch` in `dependabot.yml` (Step 3) |
 | PR not approved | Stop, suggest `/greenhouse:review-pr` |
 | CI failing | List failures, do not merge |
 | CI unverified (`CONFLICTING`, or last run's `headSha` ≠ PR head) | Stop, name both SHAs and the run id, do not merge |

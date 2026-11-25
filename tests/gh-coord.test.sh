@@ -328,6 +328,15 @@ if command -v node >/dev/null 2>&1 && [ -x "$DASH" ]; then
   }
   nm_up
   names="$(nm_start '{"kind":"review"}'), $(nm_start '{"kind":"review"}'), $(nm_start '{"kind":"fix","ticket":"7"}'), $(nm_start '{"kind":"fix","ticket":"7"}')"
+  # GH-138: sow takes no ticket, so one sent along is ignored.
+  sow=$(curl -s -X POST -H 'x-gh-dash: 1' -d '{"kind":"sow","ticket":"7"}' "http://127.0.0.1:$(cat "$NM/state/dash.port")/api/start" \
+    | node -e 'const o = JSON.parse(require("fs").readFileSync(0, "utf8")); process.stdout.write(`${o.name} ${o.run}`)')
+  # An open tst-sow chat (here a background one, so no window to focus) comes forward instead.
+  mkdir -p "$HOME/.claude/sessions"; sleep 30 & sow_pid=$!
+  printf '{"pid":%s,"sessionId":"s-sow","cwd":"%s","name":"tst-sow","kind":"bg"}\n' "$sow_pid" "$REPO" >"$HOME/.claude/sessions/$sow_pid.json"
+  sow_open=$(curl -s -X POST -H 'x-gh-dash: 1' -d '{"kind":"sow"}' "http://127.0.0.1:$(cat "$NM/state/dash.port")/api/start" \
+    | node -e 'const o = JSON.parse(require("fs").readFileSync(0, "utf8")); process.stdout.write(`${o.name} ${o.already} ${o.attach}`)')
+  kill "$sow_pid" 2>/dev/null; wait "$sow_pid" 2>/dev/null; rm -f "$HOME/.claude/sessions/$sow_pid.json"
   kill "$nm_dash" 2>/dev/null; wait "$nm_dash" 2>/dev/null
   nm_up
   again=$(nm_start '{"kind":"review"}')
@@ -335,6 +344,321 @@ if command -v node >/dev/null 2>&1 && [ -x "$DASH" ]; then
   check "loop chats take the next number, and a ticket chat that doesn't show as open is numbered, not reused" \
     '[ "$names" = "tst-review 1, tst-review 2, tst-7 fix, tst-7 fix 2" ]' "$names $(tr '\n' ' ' <"$NM/dash.log")"
   check "a restarted gh-dash remembers the names it gave out today" '[ "$again" = "tst-review 3" ]' "$again"
+  check "sow runs /greenhouse:sow-feedback in <key>-sow, ignoring a ticket number" \
+    '[ "$sow" = "tst-sow /greenhouse:sow-feedback" ]' "$sow"
+  check "an open <key>-sow chat comes forward instead of a second one starting" \
+    '[ "$sow_open" = "tst-sow true claude attach tst-sow" ]' "$sow_open"
+
+  # A sow chat claims no ticket, so its record carries its role. A background start writes the record
+  # once `claude agents` lists the new session, which this stand-in claude does.
+  SW="$ROOT/sowrole"; mkdir -p "$SW/path" "$SW/state"; echo background >"$SW/state/start-mode"
+  cat >"$SW/path/claude" <<'EOF'
+#!/bin/sh
+case "$1" in agents) echo '[{"sessionId":"0123abcd-0000-4000-8000-000000000138"}]' ;; --bg) echo "backgrounded · 0123abcd" ;; esac
+EOF
+  chmod +x "$SW/path/claude"
+  GREENHOUSE_AGENTS_DIR="$SW/state" GREENHOUSE_MAIN_REPO="$REPO" PATH="$SW/path:$PATH" GREENHOUSE_DASH_PORT=$((30000 + RANDOM % 20000)) \
+    node "$NM/bin/gh-dash" >>"$SW/dash.log" 2>&1 &
+  sw_dash=$!
+  for _ in $(seq 50); do [ -s "$SW/state/dash.port" ] && break; sleep 0.1; done
+  curl -s -X POST -H 'x-gh-dash: 1' -d '{"kind":"sow"}' "http://127.0.0.1:$(cat "$SW/state/dash.port")/api/start" >/dev/null
+  sow_rec="$SW/state/chats/0123abcd-0000-4000-8000-000000000138"
+  for _ in $(seq 50); do [ -s "$sow_rec" ] && break; sleep 0.1; done
+  kill "$sw_dash" 2>/dev/null; wait "$sw_dash" 2>/dev/null
+  check "a sow chat's record carries role=sow and no ticket, so Greenhouse files it under sow" \
+    'grep -q "^name=tst-sow$" "$sow_rec" && grep -q "^role=sow$" "$sow_rec" && ! grep -q "^ticket=" "$sow_rec"' "$(cat "$sow_rec" 2>/dev/null)"
+
+  # ── GH-136: stopping gh-dash and one of its chats ────────────────────────
+  # A Greenhouse that answers every report and records which ones were stopping reports, a stand-in
+  # claude on PATH (no fake ps here: both stop paths read real command lines), and two state folders.
+  ST="$ROOT/stop"; mkdir -p "$ST/bin" "$ST/path" "$ST/s1/chats" "$ST/s2" "$HOME/.claude/sessions" "$ROOT/elsewhere"
+  cp "$COORD" "$DASH" "$ST/bin/" && cp "$FAKE/path/claude" "$ST/path/"
+  printf 'setTimeout(() => {}, 60000);\n' >"$ST/claude"   # a chat's process: its command line contains "claude"
+  # A process that ignores SIGTERM. Its first argument ("gh-dash" or "claude") puts that word in its
+  # command line, and it creates the file named second once its handler is in place.
+  printf 'process.on("SIGTERM", () => {});\nrequire("fs").writeFileSync(process.argv[3], "");\nsetTimeout(() => {}, 30000);\n' >"$ST/stubborn"
+  node -e '
+    const http = require("http"), fs = require("fs");
+    http.createServer((req, res) => {
+      let sent = "";
+      req.on("data", (c) => { sent += c; });
+      req.on("end", () => {
+        const fn = req.url.split("?")[0].split("/").pop();
+        let stopping = false;
+        try { stopping = JSON.parse(sent).p_stopping === true; } catch {}
+        fs.appendFileSync(process.argv[1], fn + (stopping ? " stopping" : "") + "\n");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(fn === "report_agent_state" ? "true" : "[]");
+      });
+    }).listen(0, "127.0.0.1", function () { fs.writeFileSync(process.argv[2], String(this.address().port)); });
+  ' "$ST/calls" "$ST/port" &
+  st_fake=$!
+  for _ in $(seq 50); do [ -s "$ST/port" ] && break; sleep 0.1; done
+  printf "#!/bin/sh\necho \"export GREENHOUSE_URL='http://127.0.0.1:%s'\"\necho \"export GREENHOUSE_PUBLIC_KEY='pk'\"\necho \"export GREENHOUSE_JWT='jwt'\"\n" \
+    "$(cat "$ST/port")" >"$ST/bin/gh-jwt"
+  chmod +x "$ST/bin/gh-jwt"
+  # st_up <state>: serves from that state folder; waits until dash.pid names the new process.
+  st_up() {
+    GREENHOUSE_AGENTS_DIR="$1" GREENHOUSE_MAIN_REPO="$REPO" PATH="$ST/path:$PATH" GREENHOUSE_DASH_PORT=$((30000 + RANDOM % 20000)) \
+      node "$ST/bin/gh-dash" >>"$ST/dash.log" 2>&1 &
+    st_pid=$!
+    for _ in $(seq 50); do [ "$(cat "$1/dash.pid" 2>/dev/null)" = "$st_pid" ] && [ -s "$1/dash.port" ] && break; sleep 0.1; done
+  }
+  st_cmd() { (cd "$REPO" && GREENHOUSE_AGENTS_DIR="$1" GREENHOUSE_MAIN_REPO="$REPO" PATH="$ST/path:$PATH" node "$ST/bin/gh-dash" "${@:2}" 2>&1); }
+  st_url() { echo "http://127.0.0.1:$(cat "$1/dash.port")"; }
+  cmd_has() { ps -o command= -p "$1" 2>/dev/null | grep -q -- "$2"; }   # a zombie or a gone pid matches nothing
+  bg_pid() { sh -c '"$@" </dev/null >/dev/null 2>&1 & echo $!' _ "$@"; }   # orphaned at once, so init reaps it
+  # stubborn <gh-dash|claude>: starts one, waits until it ignores SIGTERM, and prints its pid.
+  stubborn() {
+    rm -f "$ST/ready"; local p; p=$(bg_pid node "$ST/stubborn" "$1" "$ST/ready")
+    for _ in $(seq 50); do [ -e "$ST/ready" ] && break; sleep 0.1; done
+    echo "$p"
+  }
+  # A session file as Claude Code writes one: session_file <pid> <session id> <cwd> <name>
+  session_file() { printf '{"pid":%s,"sessionId":"%s","cwd":"%s","name":"%s"}\n' "$1" "$2" "$3" "$4" >"$HOME/.claude/sessions/$1.json"; }
+  # The page's own card() run on a row of /api/state, against a stand-in DOM (any property or call
+  # returns the stand-in, so the page script loads). Prints {stopped, open, card} for the ticket's row.
+  render_card() {
+    local state; state=$(curl -s "$1/api/state")
+    curl -s "$1/" | node -e '
+      const vm = require("vm");
+      const html = require("fs").readFileSync(0, "utf8"), s = JSON.parse(process.argv[1]);
+      const el = new Proxy(() => {}, { get: (t, p) => (p === Symbol.toPrimitive ? () => "" : el), apply: () => el, set: () => true });
+      const ctx = vm.createContext({ document: el, fetch: () => new Promise(() => {}), setInterval: () => 0, setTimeout: () => 0, clearTimeout() {}, clearInterval() {}, confirm: () => false });
+      vm.runInContext(html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("</script>")), ctx);
+      const r = s.rows.find((x) => x.ticket === process.argv[2]);
+      process.stdout.write(r ? JSON.stringify({ stopped: r.stopped, open: !!(r.chat && r.chat.open), card: ctx.card(r, s.now) }) : "no row");
+    ' "$state" "$2"
+  }
+  # The page's own script run in node's vm against a small DOM. Elements, looked up by id or
+  # selector, keep what's set on them and the listeners added to them. querySelectorAll returns the
+  # stop buttons the cards drew, as new objects on each redraw like a browser's. The clock moves only
+  # when told, and the test answers fetch and confirm itself.
+  # page_run <page.html> <state with TST-30's chat open> prints two lines, each "ok" or what failed:
+  # the card octagon, then the header Stop.
+  page_run() {
+    node -e '
+      const vm = require("vm"), fs = require("fs");
+      const html = fs.readFileSync(process.argv[1], "utf8"), open = JSON.parse(process.argv[2]);
+      const row = open.rows.find((r) => r.ticket === "TST-30"), id1 = row.chat.id, id2 = "3a3a3a3a-0000-4000-8000-0000000000aa";
+      const two = { ...open, rows: [row, { ...row, ticket: "TST-31", label: "TST-31/work", chat: { ...row.chat, id: id2, name: "tst-31" } }] };
+      const els = new Map(), doc = { activeElement: null, title: "", on: {} };
+      const el = (key) => {
+        if (!els.has(key)) {
+          const t = { textContent: "", innerHTML: "", outerHTML: "", className: "", title: "", value: "", disabled: false, scrollTop: 0, style: {}, on: {} };
+          Object.assign(t, {
+            addEventListener: (type, fn) => { t.on[type] = fn; }, querySelector: (sel) => el(key + " " + sel), getAttribute: () => null,
+            classList: { toggle() {}, add() {}, remove() {}, contains: () => false }, focus: () => { doc.activeElement = t; }, closest: () => null,
+          });
+          els.set(key, t);
+        }
+        return els.get(key);
+      };
+      const button = (id) => {
+        const b = { disabled: false, focus: () => { doc.activeElement = b; } };
+        b.getAttribute = (n) => (n === "data-stop" ? id : n === "data-name" ? (id === id1 ? "tst-30" : "tst-31") : null);
+        return b;
+      };
+      Object.assign(doc, {
+        getElementById: (id) => el("#" + id), querySelector: (sel) => el(sel), addEventListener: (type, fn) => { doc.on[type] = fn; },
+        querySelectorAll: () => [...els.values()].flatMap((t) => [...String(t.innerHTML).matchAll(/data-stop="([^"]+)"/g)].map((m) => button(m[1]))),
+      });
+      let now = 0, seq = 0, state = two, holdState = false, yes = false, printed = 0;
+      const timers = new Map(), calls = [], asked = [];
+      const later = (fn, ms, every) => { timers.set(++seq, { fn, at: now + ms, every }); return seq; };
+      const advance = (ms) => {
+        for (const end = now + ms; ;) {
+          const due = [...timers].filter(([, t]) => t.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+          if (!due) { now = end; return; }
+          const [id, t] = due; now = t.at;
+          if (t.every) t.at += t.every; else timers.delete(id);
+          t.fn();
+        }
+      };
+      const answer = (body) => ({ ok: true, status: 200, json: () => Promise.resolve(body) });
+      const fetch = (url, opts) => {
+        const c = { url, opts: opts || {} };
+        calls.push(c);
+        if (url === "/api/state" && !holdState) return Promise.resolve(answer(state));
+        return new Promise((resolve, reject) => { c.reply = (body) => resolve(answer(body)); c.fail = () => reject(new Error("down")); });
+      };
+      const ctx = vm.createContext({
+        document: doc, fetch, confirm: (m) => { asked.push(m); return yes; },
+        setTimeout: (fn, ms) => later(fn, ms || 0, 0), setInterval: (fn, ms) => later(fn, ms, ms), clearTimeout: (id) => timers.delete(id), clearInterval: (id) => timers.delete(id),
+      });
+      const flush = () => new Promise((r) => setImmediate(r));
+      const last = (url) => calls.filter((c) => c.url === url).pop();
+      const count = (url) => calls.filter((c) => c.url === url).length;
+      (async () => {
+        vm.runInContext(html.slice(html.indexOf("<script>") + 8, html.lastIndexOf("</script>")), ctx);
+        await flush();
+        const cards = () => el("#st-work .cards").innerHTML, hint = el("#hint"), link = el("#link");
+        const armed = (id) => cards().includes(`class="stopc armed" data-stop="${id}"`);
+        const click = (id) => el(".mimic").on.click({ target: { closest: () => button(id) } });
+        const card = [], stop = [];
+        const expect = (list, name, ok) => { if (!ok) list.push(name); };
+        const say = (list) => { console.log(list.length ? list.join("; ") : "ok"); printed++; };
+
+        // The card octagon, armed from the keyboard: focus is on it when the first press arms it.
+        const was = doc.activeElement = button(id1);
+        click(id1);
+        expect(card, "the first click arms it at once", armed(id1) && cards().includes("<span>stop?</span>") && !last("/api/stop-chat"));
+        expect(card, "focus is back on it after the redraw", doc.activeElement !== was && doc.activeElement.getAttribute("data-stop") === id1);
+        const drawn = cards();
+        state = JSON.parse(JSON.stringify(two)); state.rows[0].chat.seen -= 120e3;   // the next poll brings a change, so it redraws
+        advance(2000); await flush();
+        expect(card, "the 2 s poll redraws and keeps it armed", cards() !== drawn && armed(id1));
+        advance(999); await flush();
+        expect(card, "still armed just before 3 s", armed(id1));
+        advance(1); await flush();
+        expect(card, "3 s disarms it", !cards().includes("stopc armed"));
+        click(id1); doc.on.keydown({ key: "Escape" });
+        expect(card, "Esc disarms it", !cards().includes("stopc armed"));
+        click(id1); click(id2);
+        expect(card, "arming another card disarms the first", armed(id2) && !armed(id1));
+        click(id2);
+        const sent = last("/api/stop-chat");
+        expect(card, "the second click posts the stop with the page header",
+          !!sent && sent.opts.method === "POST" && sent.opts.headers["x-gh-dash"] === "1" && JSON.parse(sent.opts.body).session === id2);
+        expect(card, "the card reads stopping while it waits", cards().includes(`disabled data-stop="${id2}"`) && cards().includes("stopping&hellip;"));
+        if (sent) sent.reply({ stopped: true });
+        await flush();
+        expect(card, "a stop names the chat in the hint", hint.textContent === "tst-31 stopped" && hint.className === "hint g" && !cards().includes("stopping&hellip;"));
+        click(id1); click(id1);
+        last("/api/stop-chat").reply({ error: "tst-30 is still running after 5 s (pid 9)" }); await flush();
+        expect(card, "a chat still running shows the error and gets its octagon back",
+          hint.textContent === "tst-30 is still running after 5 s (pid 9)" && hint.className === "hint r" && cards().includes(`class="stopc" data-stop="${id1}"`));
+
+        say(card);
+
+        // The header Stop: the question counts the open chats, and Cancel sends nothing.
+        const ask = (n) => "Stop gh-dash for tst?" + (n ? `\n\n${n} open ${n === 1 ? "chat" : "chats"} on this machine will show as ended in Greenhouse. The chats themselves keep running.` : "");
+        const pressStop = () => el("#stop").on.click();
+        for (const rows of [two.rows, [row], []]) {
+          state = { ...two, rows }; advance(2000); await flush(); pressStop();
+          expect(stop, `Cancel with ${rows.length} open asks the right question and sends nothing`, asked.pop() === ask(rows.length) && !last("/api/stop"));
+        }
+        yes = true; pressStop();
+        last("/api/stop").fail(); await flush();
+        const polls = count("/api/state");
+        advance(2000); await flush();
+        expect(stop, "a stop that fails says gh-dash is not answering and keeps polling",
+          hint.textContent === "gh-dash is not answering" && count("/api/state") === polls + 1 && link.textContent === "● CONNECTED");
+        holdState = true; advance(2000); await flush();
+        const inFlight = last("/api/state");
+        pressStop(); last("/api/stop").reply({ stopping: true }); await flush();
+        const panel = el(".mimic").outerHTML;
+        expect(stop, "a stop shows the stopped panel with the line that starts it again",
+          panel.includes("gh-dash stopped") && panel.includes("! gh-dash --detach --open") && panel.includes("reload this page once it"));
+        expect(stop, "the status reads STOPPED and Stop is disabled", link.textContent === "● STOPPED" && el("#stop").disabled === true);
+        const before = ctx.lastState, after = count("/api/state");
+        inFlight.reply(two); await flush(); advance(10000); await flush();
+        expect(stop, "the poll in flight is dropped and polling stops",
+          link.textContent === "● STOPPED" && ctx.lastState === before && count("/api/state") === after);
+
+        say(stop);
+      })().catch((e) => {
+        // Only the lines not printed yet read as crashed, so a crash in the Stop part leaves the card line standing.
+        const why = "crashed: " + String(e && e.stack || e).split("\n").slice(0, 3).join(" | ");
+        while (printed < 2) { console.log(why); printed++; }
+      });
+    ' "$1" "$2" 2>&1
+  }
+
+  out=$(st_cmd "$ST/s1" --stop); rc=$?
+  check "--stop with no dashboard running prints not running and exits 0" \
+    '[ $rc -eq 0 ] && [ "$out" = "gh-dash: not running for TST" ]' "rc=$rc out=$out"
+
+  other=$(bg_pid sleep 30)
+  echo "$other" >"$ST/s1/dash.pid"; echo 1 >"$ST/s1/dash.port"
+  out=$(st_cmd "$ST/s1" --stop); rc=$?
+  alive_after=$(kill -0 "$other" 2>/dev/null && echo yes || echo no)
+  st_up "$ST/s1"; a=$st_pid   # dash.pid and dash.port still name the sleep: a start must serve, not say already running
+  check "--stop ignores a dash.pid that points at a live non-gh-dash process" \
+    '[ $rc -eq 0 ] && [ "$out" = "gh-dash: not running for TST" ] && [ "$alive_after" = yes ] && [ "$(cat "$ST/s1/dash.pid" 2>/dev/null)" = "$a" ] && [ "$(cat "$ST/s1/dash.port")" != 1 ]' \
+    "rc=$rc out=$out sleep alive=$alive_after dash.pid=$(cat "$ST/s1/dash.pid" 2>/dev/null) a=$a $(tail -3 "$ST/dash.log")"
+  kill "$other" 2>/dev/null
+
+  st_up "$ST/s2"; b=$st_pid
+  out=$(st_cmd "$ST/s1" --stop); rc=$?
+  check "--stop stops this repo's dashboard (process gone, dash.pid gone) and leaves another state folder's dashboard running" \
+    '[ $rc -eq 0 ] && [ "$out" = "gh-dash: stopped for TST (pid $a)" ] && ! cmd_has "$a" gh-dash && [ ! -e "$ST/s1/dash.pid" ] && cmd_has "$b" gh-dash && [ -s "$ST/s2/dash.pid" ]' \
+    "rc=$rc out=$out"
+
+  stub=$(stubborn gh-dash)
+  echo "$stub" >"$ST/s1/dash.pid"; echo 1 >"$ST/s1/dash.port"
+  out=$(st_cmd "$ST/s1" --stop); rc=$?
+  check "--stop reports a dashboard still running after 5 s, exits 1, and never SIGKILLs it" \
+    '[ $rc -eq 1 ] && [ "$out" = "gh-dash: still running after 5 s (pid $stub); kill -9 $stub ends it without telling Greenhouse" ] && cmd_has "$stub" gh-dash' \
+    "rc=$rc out=$out"
+  kill -9 "$stub" 2>/dev/null; rm -f "$ST/s1/dash.pid" "$ST/s1/dash.port"
+
+  url=$(st_url "$ST/s2")
+  no_header=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$url/api/stop")
+  as_get=$(curl -s -o /dev/null -w '%{http_code}' -H 'x-gh-dash: 1' "$url/api/stop")
+  rebound=$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'x-gh-dash: 1' -H 'Host: rebound.example' "$url/api/stop")
+  sleep 0.5
+  still=$(curl -s -o /dev/null -w '%{http_code}' "$url/api/state")
+  check "POST /api/stop without x-gh-dash gets 403 and the dashboard keeps answering /api/state" \
+    '[ "$no_header" = 403 ] && [ "$as_get" = 404 ] && [ "$rebound" = 403 ] && [ "$still" = 200 ] && cmd_has "$b" gh-dash' \
+    "no header=$no_header GET=$as_get other Host=$rebound state=$still"
+
+  for _ in $(seq 60); do curl -s "$url/api/state" | grep -q '"state":"reporting"' && break; sleep 0.1; done
+  : >"$ST/calls"
+  reply=$(curl -s -X POST -H 'x-gh-dash: 1' "$url/api/stop")
+  for _ in $(seq 40); do cmd_has "$b" gh-dash || break; sleep 0.1; done
+  check "POST /api/stop with the header replies 200, sends a p_stopping report, and exits" \
+    '[ "$reply" = "{\"stopping\":true}" ] && ! cmd_has "$b" gh-dash && grep -qx "report_agent_state stopping" "$ST/calls" && [ ! -e "$ST/s2/dash.pid" ]' \
+    "reply=$reply calls=$(tr '\n' ' ' <"$ST/calls")"
+
+  # A work chat on TST-30, open in this repo, holding its claim.
+  sid=3a3a3a3a-0000-4000-8000-000000000030
+  chat=$(bg_pid node "$ST/claude")
+  session_file "$chat" "$sid" "$REPO" tst-30
+  printf 'since=x\nticket=TST-30\nrole=work\nlabel=TST-30/work\npath=%s\n' "$REPO" >"$ST/s1/chats/$sid"
+  mkdir -p "$ST/s1/claims/TST-30" && printf 'label=TST-30/work\npath=%s\nsince=x\nchat=%s\n' "$REPO" "$sid" >"$ST/s1/claims/TST-30/owner"
+  st_up "$ST/s1"; c=$st_pid; url=$(st_url "$ST/s1")
+  no_header=$(curl -s -o /dev/null -w '%{http_code}' -X POST -d "{\"session\":\"$sid\"}" "$url/api/stop-chat")
+  check "POST /api/stop-chat without x-gh-dash gets 403" '[ "$no_header" = 403 ] && cmd_has "$chat" claude' "code=$no_header"
+
+  open_state=$(curl -s "$url/api/state"); curl -s "$url/" >"$ST/page.html"   # for page_run below
+  before=$(render_card "$url" TST-30)
+  reply=$(curl -s -X POST -H 'x-gh-dash: 1' -d "{\"session\":\"$sid\"}" "$url/api/stop-chat")
+  after=$(render_card "$url" TST-30)
+  check "POST /api/stop-chat ends an open chat in this repo, and its claimed card shows the unclaim line" \
+    '[ "$reply" = "{\"stopped\":true}" ] && ! cmd_has "$chat" claude && printf "%s\n%s" "$before" "$after" | node -e '"'"'
+      const [b, a] = require("fs").readFileSync(0, "utf8").split("\n").map((l) => JSON.parse(l));
+      process.exit(b.open && b.card.includes("aria-label=\"stop tst-30\"") && a.stopped === true && !a.open && !a.card.includes("data-stop")
+        && a.card.includes("stopped from gh-dash") && a.card.includes("gh-coord unclaim TST-30 TST-30/work") ? 0 : 1);'"'"'' \
+    "reply=$reply before=$before after=$after"
+
+  plain=$(bg_pid sleep 30)
+  session_file "$plain" 3a3a3a3a-0000-4000-8000-000000000031 "$REPO" tst-31
+  away=$(bg_pid node "$ST/claude")
+  session_file "$away" 3a3a3a3a-0000-4000-8000-000000000032 "$ROOT/elsewhere" tst-32
+  refused=""
+  for s in 3a3a3a3a-0000-4000-8000-000000000031 3a3a3a3a-0000-4000-8000-000000000032 3a3a3a3a-0000-4000-8000-0000000000ff "../$sid"; do
+    refused="$refused$(curl -s -w ' %{http_code}' -X POST -H 'x-gh-dash: 1' -d "{\"session\":\"$s\"}" "$url/api/stop-chat");"
+  done
+  want="{\"error\":\"that chat isn't open in TST\"} 404;"
+  check "POST /api/stop-chat refuses a session that isn't open here, and one whose pid isn't a claude process" \
+    '[ "$refused" = "$want$want$want$want" ] && cmd_has "$plain" sleep && cmd_has "$away" claude' "$refused"
+
+  stub=$(stubborn claude)
+  session_file "$stub" 3a3a3a3a-0000-4000-8000-000000000033 "$REPO" tst-33
+  reply=$(curl -s -w ' %{http_code}' -X POST -H 'x-gh-dash: 1' -d '{"session":"3a3a3a3a-0000-4000-8000-000000000033"}' "$url/api/stop-chat")
+  check "POST /api/stop-chat answers 409 for a chat still running after 5 s, and never SIGKILLs it" \
+    '[ "$reply" = "{\"error\":\"tst-33 is still running after 5 s (pid $stub)\"} 409" ] && cmd_has "$stub" claude' "reply=$reply"
+  kill -9 "$stub" 2>/dev/null
+
+  page=$(page_run "$ST/page.html" "$open_state")
+  check "the page: a card's octagon arms for 3 s and stays armed (and focused) across a redraw; Esc or arming another disarms it; a second click stops it" \
+    '[ "$(echo "$page" | sed -n 1p)" = ok ]' "$page"
+  check "the page: Stop asks with the open-chat count and Cancel sends nothing; a failed stop keeps polling; a stop shows the stopped panel and drops the poll in flight" \
+    '[ "$(echo "$page" | sed -n 2p)" = ok ]' "$page"
+
+  kill "$a" "$b" "$c" "$st_fake" 2>/dev/null; kill "$plain" "$away" "$chat" 2>/dev/null
+  wait "$a" "$b" "$c" "$st_fake" 2>/dev/null
 else
   not_ok "gh-dash report payload" "node or gh-dash missing"
 fi

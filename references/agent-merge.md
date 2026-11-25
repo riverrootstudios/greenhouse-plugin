@@ -9,7 +9,8 @@ Run under `/loop` (`/loop 5m /greenhouse:merge-pr --agent`, or `/loop /greenhous
 ## Hard rules
 
 - Merge only into the integration branch (`BASE` in `GC config`) or `epic/*`. Never `main` when it isn't the integration branch, never `release/*`, never a stacked PR's feature-branch base. Never tag, promote, or open an epic PR.
-- Only PRs authored by `$GH_ME`. A collaborator's PR is never yours to merge.
+- Only PRs authored by `$GH_ME`. A collaborator's PR is never yours to merge. The one exception is a Dependabot PR whose ticket is assigned to `$ME` (GH-135): its project's dependency owner lands it.
+- Never push to a Dependabot branch: no rebase, no commit, no force-push. Dependabot stops maintaining a PR once anyone else pushes to it. It rebases its own PR when asked (§3).
 - Never merge content the reviewer didn't see (§2a), except the changes agent mode makes to meet the approval's merge conditions (§2c), each mapped to its sha in a PR comment. Never dismiss a review.
 - **An approval means do the conditions, then merge.** Never send an approved PR back to `changes_requested` or to a fix chat, and never ask the reviewer to look again. Every CI job green on the head is the gate.
 - Never touch `$MAIN` (protocol §2) and never start the dev server. The ticket's worktree is usually all a tick needs. Take the DB lock only for a database-touching change (§3.6), and release it right after.
@@ -21,7 +22,8 @@ Run under `/loop` (`/loop 5m /greenhouse:merge-pr --agent`, or `/loop /greenhous
 0. Under `/loop`, the tick's first command is `GC tick` and its last is `GC tick <minutes to the next tick>` ([parallel-agents §9](parallel-agents.md#9-under-loop)). A one-shot run skips both.
 1. `DASH --detach`, then `eval "$(GC greenhouse-env)"`: `ME=$GREENHOUSE_TEAM_USERNAME`, `KEY=$GREENHOUSE_PROJECT_KEY`, `GH_ME=$(gh api user --jq .login)`. Then `GC status` and `GC config`.
 2. `gh pr list --author @me --state open --json number,title,headRefName,baseRefName,reviewDecision,isDraft,labels,mergeStateStatus,headRefOid,body`. Keep the PRs that are `APPROVED`, not a draft, without a `hold` label, and based on `$BASE` or `epic/*`. A ticket or PR in the arguments narrows this to that one.
-3. Resolve the ticket from `Implements $KEY-{n}` in the body. It must be `assignee=$ME` and not `harvest` or `weeded`. Drop any ticket claimed in `GC status` under a label other than `$KEY-{n}/merge` (a work or fix chat has it).
+   Also `gh pr list --author app/dependabot --state open --json number,title,url,headRefName,baseRefName,reviewDecision,isDraft,labels,mergeStateStatus,headRefOid,body`, kept by the same rules.
+3. Resolve the ticket from `Implements $KEY-{n}` in the body. For a Dependabot PR, it's the ticket PR sync filed for it: `GET /rest/v1/tickets?source_pr_url=eq.{url}&select=id,display_id,status,assignee` (no row yet → skip it this tick). It must be `assignee=$ME` and not `harvest` or `weeded`. Drop any ticket claimed in `GC status` under a label other than `$KEY-{n}/merge` (a work or fix chat has it).
 4. Nothing left → one line ("nothing approved") and end the tick.
 5. Order: this chat's in-flight claim first, then a PR that's CLEAN with CI green on its head (merge it now), then the oldest approval. **One PR in flight at a time.** Don't rebase a second PR while one waits on CI; the merge would make it BEHIND again. Parked PRs (waiting on someone else) and PRs with a question for the user don't block the line.
 
@@ -50,11 +52,15 @@ Read the ticket's latest `gh-loop merge` comment (§4) and the comments after it
 
 **d. CI on the head, every job.** Run [common-operations §CI on the Current Head](common-operations.md#ci-on-the-current-head), then `gh run view <id> --json jobs`. Every job must be `success`, not only the required ones. Pending → wait for a later tick. On a failure, run `gh run rerun <id> --failed` once per head sha and record that the rerun was spent. A second failure on the same head → an ask item for §5: name the failing test, and offer filing a flake ticket (only on a yes) or leaving the PR until someone fixes it.
 
-**e. Freshness.** `mergeStateStatus` BEHIND or DIRTY → it needs a rebase (§3).
+**e. Freshness.** `mergeStateStatus` BEHIND or DIRTY → it needs a rebase (§3). A Dependabot PR is rebased by Dependabot (§3, Dependabot PRs).
 
 `dry` stops here: print each PR's gates, its conditions with their class, and the step this tick would take.
 
 ## 3. Apply (the one PR in flight)
+
+**Dependabot PRs** skip this section's worktree, rebase and publish steps: nothing is ever pushed to their branch. Review-pr never gives them merge conditions, so the only thing to apply is freshness:
+- BEHIND → comment `@dependabot rebase` on the PR, once per base sha: record that sha as `rebase=` in the §4 marker, and comment again only after the base moves. Then wait for a later tick (Dependabot pushes the rebase and CI runs on it).
+- A rebase Dependabot can't do (DIRTY, or Dependabot answers that it won't rebase) → an ask item for §5: close it so Dependabot opens a fresh PR (recommended), or leave it for a person.
 
 1. `eval "$(GC paths $KEY-{n})"`, then `GC claim $KEY-{n} $KEY-{n}/merge "$WT"`. `TAKEN` → skip it this tick.
 2. Worktree, per the protocol's §3:
@@ -92,10 +98,12 @@ Then `GC unclaim $KEY-{n} $KEY-{n}/merge`, and go on to the next candidate in th
 ```
 Loop merge: {rebased and pushed {short sha}, CI pending | conditions applied at {short sha} | parked: waiting on {who} to {what} | decided by {user}: {decision} → {answer}, because {reason} | merged at {squash sha}; walk owed: {walk}}
 
-[//]: # (gh-loop merge approved={sha} pushed={sha} rerun={sha or -} parked={yes|no})
+[//]: # (gh-loop merge approved={sha} pushed={sha} rerun={sha or -} parked={yes|no} rebase={base sha or -})
 ```
 
-`parked=yes` only while the PR waits on someone else (head changed after approval, needs re-review). A question for the user is never a park: it's asked in this tick's box.
+`parked=yes` only while the PR waits on someone else (head changed after approval, needs re-review). A question for the user is never a park: it's asked in this tick's box. `rebase=` is the base sha a Dependabot PR was last asked to rebase onto (`-` for any other PR).
+
+A Dependabot PR's head moving after approval is Dependabot's own rebase when `git range-diff` shows only that, like §2a's rebase case. Merging it uses merge-pr's Dependabot squash subject, and cleanup has no worktree to remove and no branch to delete (the `dependabot/*` branch is Dependabot's).
 
 ## 5. Ask, then the tick summary
 
